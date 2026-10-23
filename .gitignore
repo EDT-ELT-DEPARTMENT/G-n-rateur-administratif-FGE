@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+*.docx
+# Do not commit personnel/source files containing personal data.
+source_personnel.xlsx
+source_personnel.csv
+Donnees_Personnel.xlsx
+
+# Local database and generated private request data
+attestation_requests.sqlite3*
