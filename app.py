@@ -177,8 +177,8 @@ role = st.radio("Accès à l'application", role_options, horizontal=True, key="w
 mode = backend_mode()
 if mode == "sqlite":
     st.warning(
-        "Stockage local activé (SQLite). Pour une application hébergée sur Streamlit Cloud, configurez Supabase "
-        "dans les Secrets et exécutez `supabase_schema.sql` : sans base persistante, les demandes peuvent être perdues lors d'un redémarrage Cloud."
+        ""
+        ""
     )
 
 if role == "Déposer une demande":
