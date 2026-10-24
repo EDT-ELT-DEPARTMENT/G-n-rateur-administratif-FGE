@@ -540,6 +540,12 @@ if role == "Déposer une demande":
                 lieu_naissance_req = st.text_input("Lieu de naissance *", value=selected_person.get("lieu_naissance", ""), max_chars=160, key=f"req_birthplace_{selected_source_idx}")
                 email_req = st.text_input("Adresse e-mail de contact", value=selected_person.get("email", ""), max_chars=180, key=f"req_email_{selected_source_idx}")
                 telephone_req = st.text_input("Téléphone de contact", value=selected_person.get("telephone", ""), max_chars=50, key=f"req_phone_{selected_source_idx}")
+            st.markdown("#### Identité en arabe (préremplie depuis la source, modifiable)")
+            ar_c1, ar_c2 = st.columns(2)
+            with ar_c1:
+                nom_ar_req = st.text_input("Nom en arabe", value=selected_person.get("nom_ar", ""), max_chars=100, key=f"req_nom_ar_{selected_source_idx}")
+            with ar_c2:
+                prenom_ar_req = st.text_input("Prénom en arabe", value=selected_person.get("prenom_ar", ""), max_chars=120, key=f"req_prenom_ar_{selected_source_idx}")
             purpose_req = st.text_area("Précisions facultatives à transmettre au chef", max_chars=1500, placeholder="Ex. : précision utile pour identifier ou traiter la demande…")
             accepted_privacy = st.checkbox("Je confirme être la personne sélectionnée et que les informations affichées sont exactes.")
             submit_req = st.form_submit_button("📨 Envoyer la demande au chef de département", type="primary", use_container_width=True)
@@ -564,9 +570,9 @@ if role == "Déposer une demande":
                     source_snapshot = {
                         "source_row": selected_person.get("source_row"),
                         "source_nom_complet_fr": selected_person.get("full_name_fr", ""),
-                        "source_nom_complet_ar": selected_person.get("full_name_ar", ""),
-                        "nom_ar": selected_person.get("nom_ar", ""),
-                        "prenom_ar": selected_person.get("prenom_ar", ""),
+                        "source_nom_complet_ar": " ".join(part for part in (nom_ar_req.strip(), prenom_ar_req.strip()) if part),
+                        "nom_ar": nom_ar_req.strip(),
+                        "prenom_ar": prenom_ar_req.strip(),
                         "matiere_s1": edt_subjects_text or selected_person.get("matiere_s1", ""),
                         "edt_subjects_text": edt_subjects_text,
                         "edt_subjects": edt_subjects,

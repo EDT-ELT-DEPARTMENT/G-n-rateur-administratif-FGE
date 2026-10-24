@@ -18,7 +18,23 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 BASE_DIR = Path(__file__).resolve().parent
-LOGO_PATH = BASE_DIR / "assets" / "logo_udl.png"
+
+def _resolve_logo_path() -> Path:
+    """Priorité au logo.PNG placé à la racine du dépôt GitHub.
+
+    Des chemins de repli sont conservés pour les anciennes installations.
+    La casse du nom est volontairement exacte pour Streamlit Cloud sous Linux.
+    """
+    candidates = (
+        BASE_DIR / "logo.PNG",
+        BASE_DIR / "logo.png",
+        BASE_DIR / "assets" / "logo.PNG",
+        BASE_DIR / "assets" / "logo.png",
+        BASE_DIR / "assets" / "logo_udl.png",
+    )
+    return next((path for path in candidates if path.is_file()), candidates[-1])
+
+LOGO_PATH = _resolve_logo_path()
 
 DEPARTEMENTS = {
     "Electrotechnique": {"ar": "الكهروتقني", "fr": "Électrotechnique"},
@@ -307,7 +323,7 @@ def issue_year(values: dict[str, Any]) -> str:
     return match.group(0) if match else str(date.today().year)
 
 
-def add_field_pair(doc, left_label: str, left_value: str, right_label: str, *, size=10.5):
+def add_field_pair(doc, left_label: str, left_value: str, right_label: str, *, size=10.5, value_rtl: bool = False):
     table = doc.add_table(rows=1, cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
@@ -322,8 +338,10 @@ def add_field_pair(doc, left_label: str, left_value: str, right_label: str, *, s
         set_cell_padding(c, top=0, start=0, bottom=0, end=100)
     p = left.paragraphs[0]
     style_paragraph(p, WD_ALIGN_PARAGRAPH.LEFT, rtl=False, after=1)
-    r = p.add_run(f"{left_label} : {left_value}")
+    r = p.add_run(f"{left_label} : ")
     set_run_font(r, size=size)
+    value_run = p.add_run(left_value)
+    set_run_font(value_run, size=size, rtl=value_rtl)
     p = right.paragraphs[0]
     style_paragraph(p, WD_ALIGN_PARAGRAPH.RIGHT, rtl=True, after=1)
     r = p.add_run(right_label)
@@ -360,8 +378,10 @@ def add_arabic_page(doc, values: dict[str, Any], page_label: str):
     dept_ar = DEPARTEMENTS[dept]["ar"]
     sentence = f"أنا الممضي(ة) أسفله السيد(ة) {chef} رئيس(ة) قسم {dept_ar} بكلية الهندسة الكهربائية بجامعة جيلالي ليابس بسيدي بلعباس، أشهد أن السيد(ة):"
     add_para(doc, sentence, rtl=True, size=11, after=12, line_spacing=1.0)
-    add_field_pair(doc, "Nom", format_value(values.get("nom")), "اللقب:")
-    add_field_pair(doc, "Prénom", format_value(values.get("prenom")), "الاسم:")
+    nom_ar_value = format_value(values.get("nom_ar") or values.get("nom"))
+    prenom_ar_value = format_value(values.get("prenom_ar") or values.get("prenom"))
+    add_field_pair(doc, "Nom", nom_ar_value, "اللقب:", value_rtl=bool(values.get("nom_ar")))
+    add_field_pair(doc, "Prénom", prenom_ar_value, "الاسم:", value_rtl=bool(values.get("prenom_ar")))
     birth_date = format_value(values.get("date_naissance"), "……/……/………")
     birth_place = format_value(values.get("lieu_naissance"), "........................")
     add_para(doc, f"المولود(ة) بتاريخ: {birth_date} بـ {birth_place}", rtl=True, size=10.5, after=50)

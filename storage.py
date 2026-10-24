@@ -77,6 +77,7 @@ def _connect() -> sqlite3.Connection:
             email TEXT NOT NULL DEFAULT '',
             telephone TEXT NOT NULL DEFAULT '',
             purpose TEXT NOT NULL DEFAULT '',
+            source_snapshot TEXT NOT NULL DEFAULT '{}',
             language_mode TEXT NOT NULL DEFAULT 'Bilingue (arabe puis français)',
             status TEXT NOT NULL DEFAULT 'En attente',
             final_data TEXT,
@@ -90,6 +91,10 @@ def _connect() -> sqlite3.Connection:
             last_number INTEGER NOT NULL
         );
     """)
+    # Migration sans perte pour les bases locales créées avec l'ancienne version.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(attestation_requests)").fetchall()}
+    if "source_snapshot" not in columns:
+        conn.execute("ALTER TABLE attestation_requests ADD COLUMN source_snapshot TEXT NOT NULL DEFAULT '{}' ")
     return conn
 
 
@@ -104,6 +109,13 @@ def _sqlite_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
             data["final_data"] = {}
     else:
         data["final_data"] = {}
+    if data.get("source_snapshot"):
+        try:
+            data["source_snapshot"] = json.loads(data["source_snapshot"])
+        except (TypeError, json.JSONDecodeError):
+            data["source_snapshot"] = {}
+    else:
+        data["source_snapshot"] = {}
     return data
 
 
@@ -122,6 +134,7 @@ def create_request(payload: dict[str, Any]) -> dict[str, Any]:
         "email": str(payload.get("email", "")).strip(),
         "telephone": str(payload.get("telephone", "")).strip(),
         "purpose": str(payload.get("purpose", "")).strip(),
+        "source_snapshot": payload.get("source_snapshot", {}) if isinstance(payload.get("source_snapshot", {}), dict) else {},
         "language_mode": str(payload.get("language_mode", "Bilingue (arabe puis français)")),
         "status": "En attente",
         "final_data": {},
@@ -133,6 +146,7 @@ def create_request(payload: dict[str, Any]) -> dict[str, Any]:
     if client:
         row = {k: v for k, v in data.items() if k != "final_data"}
         row["final_data"] = None
+        row["source_snapshot"] = data["source_snapshot"]
         result = client.table("attestation_requests").insert(row).execute()
         if result.data:
             return _normalize_supabase_row(result.data[0])
@@ -142,11 +156,11 @@ def create_request(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         conn.execute("""INSERT INTO attestation_requests
             (id, created_at, updated_at, department, nom, prenom, date_naissance, lieu_naissance,
-             email, telephone, purpose, language_mode, status, final_data, attestation_number, issued_date, issued_year)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             email, telephone, purpose, source_snapshot, language_mode, status, final_data, attestation_number, issued_date, issued_year)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (data["id"], data["created_at"], data["updated_at"], data["department"], data["nom"], data["prenom"],
              data["date_naissance"], data["lieu_naissance"], data["email"], data["telephone"], data["purpose"],
-             data["language_mode"], data["status"], "{}", None, None, None))
+             json.dumps(data["source_snapshot"], ensure_ascii=False), data["language_mode"], data["status"], "{}", None, None, None))
         row = conn.execute("SELECT * FROM attestation_requests WHERE id = ?", (request_id,)).fetchone()
         return _sqlite_row(row) or data
     finally:
@@ -162,6 +176,13 @@ def _normalize_supabase_row(row: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             fd = {}
     result["final_data"] = fd if isinstance(fd, dict) else {}
+    snapshot = result.get("source_snapshot")
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except json.JSONDecodeError:
+            snapshot = {}
+    result["source_snapshot"] = snapshot if isinstance(snapshot, dict) else {}
     return result
 
 
