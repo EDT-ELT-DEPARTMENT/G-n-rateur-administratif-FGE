@@ -57,12 +57,12 @@ FIELD_DEFS = [
     ("matiere_s1", "Matière(s) du semestre 1", ["matiere s1", "matières s1", "matiere semestre 1", "matières semestre 1", "matiere_s1", "matiere premier semestre", "matière premier semestre", "s1 matiere", "s1 matières"]),
     ("debut_s1", "Début de la période au semestre 1", ["debut s1", "date debut s1", "debut periode s1", "date debut semestre 1", "debut_s1"]),
     ("fin_s1", "Fin de la période au semestre 1", ["fin s1", "date fin s1", "fin periode s1", "date fin semestre 1", "fin_s1"]),
-    ("section_s1", "Section / niveau / groupe du semestre 1", ["section s1", "groupe s1", "niveau s1", "section_s1", "departement pedagogique s1"]),
+    ("promotions_s1", "Promotion(s) du semestre 1", ["promotion s1", "promotions s1", "promotion(s) s1", "promotions_s1", "section s1", "groupe s1", "niveau s1", "section_s1", "departement pedagogique s1"]),
     ("annee_s1", "Année universitaire du semestre 1", ["annee s1", "annee universitaire s1", "annee_s1", "année universitaire s1", "annee universitaire"]),
     ("matiere_s2", "Matière(s) du semestre 2", ["matiere s2", "matières s2", "matiere semestre 2", "matières semestre 2", "matiere_s2", "matiere deuxieme semestre", "s2 matiere", "s2 matières"]),
     ("debut_s2", "Début de la période au semestre 2", ["debut s2", "date debut s2", "debut periode s2", "date debut semestre 2", "debut_s2"]),
     ("fin_s2", "Fin de la période au semestre 2", ["fin s2", "date fin s2", "fin periode s2", "date fin semestre 2", "fin_s2"]),
-    ("section_s2", "Section / niveau / groupe du semestre 2", ["section s2", "groupe s2", "niveau s2", "section_s2"]),
+    ("promotions_s2", "Promotion(s) du semestre 2", ["promotion s2", "promotions s2", "promotion(s) s2", "promotions_s2", "section s2", "groupe s2", "niveau s2", "section_s2"]),
     ("annee_s2", "Année universitaire du semestre 2", ["annee s2", "annee universitaire s2", "annee_s2", "année universitaire s2"]),
 ]
 
@@ -360,9 +360,9 @@ def add_semester_ar(doc, semester_num: int, values: dict[str, Any]):
         add_para(doc, txt, rtl=True, size=10.5, after=23, line_spacing=1.0)
     period = f"تاريخ التوظيف: ابتداءً من {format_value(values.get(f'debut_{key}'), '……/……/………')} إلى غاية {format_value(values.get(f'fin_{key}'), '……/……/………')}"
     add_para(doc, period, rtl=True, size=10.5, before=2, after=8)
-    section = format_value(values.get(f"section_{key}"), "................")
+    promotions = format_value(values.get(f"promotions_{key}") or values.get(f"section_{key}"), "................")
     year = format_value(values.get(f"annee_{key}"), "……/……")
-    add_para(doc, f"القسم: {section}       السنة الجامعية: {year}", rtl=True, size=10.5, after=15)
+    add_para(doc, f"الدفعة/الدفعات: {promotions}       السنة الجامعية: {year}", rtl=True, size=10.5, after=15)
 
 
 def add_arabic_page(doc, values: dict[str, Any], page_label: str):
@@ -401,7 +401,8 @@ def add_semester_fr(doc, n: int, values: dict[str, Any]):
         txt = lines[i] if i < len(lines) else "........................................................................................................"
         add_para(doc, txt, align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, after=8)
     add_para(doc, f"Période d'enseignement : du {format_value(values.get(f'debut_{key}'), '……/……/………')} au {format_value(values.get(f'fin_{key}'), '……/……/………')}", align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, after=6)
-    add_para(doc, f"Groupe / section : {format_value(values.get(f'section_{key}'), '................')}       Année universitaire : {format_value(values.get(f'annee_{key}'), '……/……')}", align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, after=8)
+    promotions = format_value(values.get(f'promotions_{key}') or values.get(f'section_{key}'), '................')
+    add_para(doc, f"Promotion(s) : {promotions}       Année universitaire : {format_value(values.get(f'annee_{key}'), '……/……')}", align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, after=8)
 
 
 def add_french_page(doc, values: dict[str, Any], page_label: str):

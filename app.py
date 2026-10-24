@@ -220,8 +220,43 @@ def _safe_filename(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "")).strip("_") or "Personnel"
 
 
-def _attestations_zip(records: list[dict]) -> tuple[bytes, int]:
-    """Regroupe toutes les attestations déjà émises; ne crée pas d'attestations pending."""
+def _edt_subjects_grouped_by_type(sessions: list[dict]) -> tuple[list[str], str]:
+    """Retourne les matières uniques groupées par type d'enseignement tiré de l'EDT.
+
+    Exemple : ``Cours : Réseaux électriques, Machines électriques`` puis une ligne TD
+    et/ou TP. Le type vient de la colonne Code de l'EDT, pas du formulaire personnel.
+    """
+    order = ["Cours", "TD", "TP", "Autre"]
+    grouped: dict[str, list[str]] = {kind: [] for kind in order}
+    seen: set[tuple[str, str]] = set()
+    for session in sessions:
+        subject = _source_value(session.get("Matiere") or session.get("Enseignements", ""))
+        if not subject:
+            continue
+        kind = _source_value(session.get("Type", ""))
+        if kind not in grouped:
+            kind = "Autre"
+        key = (kind, _norm_source_header(subject))
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped[kind].append(subject)
+    lines = [f"{kind} : {', '.join(grouped[kind])}" for kind in order if grouped[kind]]
+    return [f"{kind} — {subject}" for kind in order for subject in grouped[kind]], "\n".join(lines)
+
+
+def _edt_promotions(sessions: list[dict]) -> list[str]:
+    """Promotions présentes dans les séances effectivement associées à l'enseignant."""
+    seen: dict[str, str] = {}
+    for session in sessions:
+        value = _source_value(session.get("Promotion", ""))
+        if value:
+            seen.setdefault(_norm_source_header(value), value)
+    return sorted(seen.values(), key=_norm_source_header)
+
+
+def _attestations_zip(records: list[dict], language_mode: str | None = None) -> tuple[bytes, int]:
+    """Regroupe les attestations déjà émises dans la langue choisie, sans réattribuer de numéro."""
     out = BytesIO()
     count = 0
     used_names: set[str] = set()
@@ -232,7 +267,9 @@ def _attestations_zip(records: list[dict]) -> tuple[bytes, int]:
             values = values_from_record(record)
             if not values.get("numero") or not values.get("date_attestation"):
                 continue
-            docx = generate_attestation(values, store_language_mode(record))
+            # La langue choisie pour le lot modifie seulement la copie dans le ZIP.
+            # Le numéro, la date et la référence de l'attestation déjà émise restent inchangés.
+            docx = generate_attestation(values, language_mode or store_language_mode(record))
             base = _safe_filename(
                 f"Attestation_{values.get('nom','')}_{values.get('prenom','')}_"
                 f"{values.get('department','')}_{values['numero']}_{record.get('issued_year','')}"
@@ -350,6 +387,10 @@ def values_from_record(record: dict) -> dict:
         values["nom_ar"] = source_snapshot.get("nom_ar", "")
     if not values.get("prenom_ar"):
         values["prenom_ar"] = source_snapshot.get("prenom_ar", "")
+    if not values.get("promotions_s1"):
+        values["promotions_s1"] = values.get("section_s1") or source_snapshot.get("edt_promotions_text", "")
+    if not values.get("promotions_s2"):
+        values["promotions_s2"] = values.get("section_s2", "")
     # Les informations identitaires déposées par le demandeur restent la source de vérité.
     values.update({
         "department": record.get("department", "Electrotechnique"),
@@ -484,7 +525,13 @@ if role == "Déposer une demande":
                 )
 
         edt_subjects = unique_subjects(edt_sessions)
-        edt_subjects_text = "\n".join(edt_subjects)
+        edt_subjects_with_type, edt_subjects_text = _edt_subjects_grouped_by_type(edt_sessions)
+        edt_promotions = _edt_promotions(edt_sessions)
+        edt_promotions_text = ", ".join(edt_promotions)
+        if not edt_sessions:
+            # La matière auto-déclarée reste visible comme solution de repli, mais aucun type
+            # n'est inventé lorsque le nom ne correspond pas à l'EDT.
+            edt_subjects_text = _source_value(selected_person.get("matiere_s1", ""))
         st.info(
             f"**Nom en français :** {selected_person['full_name_fr']}  \n"
             f"**Nom en arabe :** {selected_person.get('full_name_ar') or 'Non renseigné'}  \n"
@@ -514,7 +561,8 @@ if role == "Déposer une demande":
             with exp3:
                 st.download_button("📄 Télécharger l'EDT en PDF", data=pdf_bytes, file_name=f"EDT_{safe_teacher}.pdf", mime="application/pdf", use_container_width=True, key=f"edt_pdf_{selected_source_idx}")
             with st.expander(f"📚 Matières distinctes détectées ({len(edt_subjects)})", expanded=False):
-                st.write("\n".join(f"- {subject}" for subject in edt_subjects) or "Aucune matière détectée.")
+                st.write("\n".join(f"- {subject}" for subject in edt_subjects_with_type) or "Aucune matière détectée.")
+                st.write("**Promotion(s) trouvée(s) :** " + (edt_promotions_text or "Aucune promotion détectée."))
         else:
             st.warning("Aucune séance n'a été trouvée dans EDT_Edition.xlsx pour ce nom. Les matières du formulaire source restent disponibles comme solution de repli ; vérifiez le nom ou utilisez l'association manuelle ci-dessus.")
 
@@ -576,6 +624,9 @@ if role == "Déposer une demande":
                         "matiere_s1": edt_subjects_text or selected_person.get("matiere_s1", ""),
                         "edt_subjects_text": edt_subjects_text,
                         "edt_subjects": edt_subjects,
+                        "edt_subjects_with_type": edt_subjects_with_type,
+                        "edt_promotions": edt_promotions,
+                        "edt_promotions_text": edt_promotions_text,
                         "edt_teacher_names": edt_matched_teachers,
                         "edt_match_mode": edt_match_mode,
                         "edt_source_file": edt_source_name if edt_bytes else "",
@@ -699,7 +750,8 @@ else:
                         src1.write("**Nom complet (arabe) :** " + (source_snapshot.get("source_nom_complet_ar") or "Non renseigné"))
                         src2.write("**Type d'enseignement :** " + (source_snapshot.get("type_enseignement") or "Non renseigné"))
                         src2.write("**Dernier diplôme :** " + (source_snapshot.get("dernier_diplome") or "Non renseigné"))
-                        src3.write("**Matière(s) S1 dans la source :** " + (source_snapshot.get("edt_subjects_text") or source_snapshot.get("matiere_s1") or "Non renseignée"))
+                        src3.write("**Matière(s) S1 avec type :** " + (source_snapshot.get("edt_subjects_text") or source_snapshot.get("matiere_s1") or "Non renseignée"))
+                        src3.write("**Promotion(s) EDT :** " + (source_snapshot.get("edt_promotions_text") or "Non renseignée"))
                         if source_snapshot.get("edt_session_count"):
                             st.success(f"EDT automatiquement associé : {source_snapshot.get('edt_session_count')} séance(s), {len(source_snapshot.get('edt_subjects') or [])} matière(s) distincte(s).")
                             if source_snapshot.get("edt_match_mode") == "approximatif":
@@ -728,17 +780,19 @@ else:
                         with ca2:
                             prenom_ar_final = st.text_input("Prénom en arabe", value=source_snapshot.get("prenom_ar", ""), key=f"final_prenom_ar_{selected_id}")
                         st.markdown("#### Semestre 1")
-                        if source_snapshot.get("matiere_s1"):
-                            st.caption("La matière S1 est préremplie depuis le fichier source. Vérifiez et complétez si nécessaire.")
+                        if source_snapshot.get("edt_subjects_text"):
+                            st.caption("Les matières S1 sont regroupées par type (Cours, TD, TP) d'après la colonne Code de EDT_Edition.xlsx. Vérifiez et complétez si nécessaire.")
+                        elif source_snapshot.get("matiere_s1"):
+                            st.warning("Aucune correspondance fiable avec EDT_Edition.xlsx : la matière déclarée dans le formulaire est affichée sans type confirmé. Associez le nom à l'EDT ou vérifiez les types manuellement.")
                         s11, s12, s13 = st.columns(3)
                         with s11:
                             s1_default = source_snapshot.get("edt_subjects_text") or source_snapshot.get("matiere_s1", "")
-                            matiere_s1 = st.text_area("Matière(s) du semestre 1 — préremplies depuis EDT_Edition.xlsx", value=s1_default, height=120, key=f"final_s1_mat_{selected_id}")
+                            matiere_s1 = st.text_area("Matière(s) du semestre 1 — types Cours / TD / TP importés depuis EDT_Edition.xlsx", value=s1_default, height=120, key=f"final_s1_mat_{selected_id}")
                         with s12:
                             debut_s1 = st.text_input("Début de la période — S1 (JJ/MM/AAAA)", key=f"final_s1_start_{selected_id}")
                             fin_s1 = st.text_input("Fin de la période — S1 (JJ/MM/AAAA)", key=f"final_s1_end_{selected_id}")
                         with s13:
-                            section_s1 = st.text_input("Section / niveau / groupe — S1", key=f"final_s1_section_{selected_id}")
+                            promotion_s1 = st.text_input("Promotion(s) — S1 (importées depuis EDT_Edition.xlsx)", value=source_snapshot.get("edt_promotions_text", ""), key=f"final_s1_promotions_{selected_id}")
                             annee_s1 = st.text_input("Année universitaire — S1", value=f"{date.today().year}/{date.today().year + 1}", key=f"final_s1_year_{selected_id}")
                         st.markdown("#### Semestre 2")
                         s21, s22, s23 = st.columns(3)
@@ -748,7 +802,7 @@ else:
                             debut_s2 = st.text_input("Début de la période — S2 (JJ/MM/AAAA)", key=f"final_s2_start_{selected_id}")
                             fin_s2 = st.text_input("Fin de la période — S2 (JJ/MM/AAAA)", key=f"final_s2_end_{selected_id}")
                         with s23:
-                            section_s2 = st.text_input("Section / niveau / groupe — S2", key=f"final_s2_section_{selected_id}")
+                            promotion_s2 = st.text_input("Promotion(s) — S2", key=f"final_s2_promotions_{selected_id}", help="À compléter si les promotions du semestre 2 diffèrent de celles de l'EDT source disponible.")
                             annee_s2 = st.text_input("Année universitaire — S2", value=f"{date.today().year}/{date.today().year + 1}", key=f"final_s2_year_{selected_id}")
                         issue_button = st.form_submit_button("🖨️ Générer l'attestation officielle et attribuer le numéro", type="primary", use_container_width=True)
                     if issue_button:
@@ -764,9 +818,9 @@ else:
                                 "chef_fr": chef_fr.strip(), "chef_ar": chef_ar.strip(),
                                 "reference": reference.strip() or REFERENCE_PAR_DEFAUT,
                                 "matiere_s1": matiere_s1.strip(), "debut_s1": debut_s1.strip(), "fin_s1": fin_s1.strip(),
-                                "section_s1": section_s1.strip(), "annee_s1": annee_s1.strip(),
+                                "promotions_s1": promotion_s1.strip(), "section_s1": promotion_s1.strip(), "annee_s1": annee_s1.strip(),
                                 "matiere_s2": matiere_s2.strip(), "debut_s2": debut_s2.strip(), "fin_s2": fin_s2.strip(),
-                                "section_s2": section_s2.strip(), "annee_s2": annee_s2.strip(),
+                                "promotions_s2": promotion_s2.strip(), "section_s2": promotion_s2.strip(), "annee_s2": annee_s2.strip(),
                                 "language_mode": language_final,
                                 "nom_ar": nom_ar_final.strip(),
                                 "prenom_ar": prenom_ar_final.strip(),
@@ -775,6 +829,10 @@ else:
                                 "type_enseignement_source": source_snapshot.get("type_enseignement", ""),
                                 "dernier_diplome_source": source_snapshot.get("dernier_diplome", ""),
                                 "edt_subjects": source_snapshot.get("edt_subjects", []),
+                                "edt_subjects_with_type": source_snapshot.get("edt_subjects_with_type", []),
+                                "edt_subjects_text": source_snapshot.get("edt_subjects_text", ""),
+                                "edt_promotions": source_snapshot.get("edt_promotions", []),
+                                "edt_promotions_text": source_snapshot.get("edt_promotions_text", ""),
                                 "edt_teacher_names": source_snapshot.get("edt_teacher_names", []),
                                 "edt_session_count": source_snapshot.get("edt_session_count", 0),
                                 "edt_source_file": source_snapshot.get("edt_source_file", "EDT_Edition.xlsx"),
@@ -810,7 +868,14 @@ else:
                 zip_issued_records = []
                 st.error(f"Impossible de préparer l'archive des attestations : {exc}")
             if zip_issued_records:
-                zip_data, zip_count = _attestations_zip(zip_issued_records)
+                bulk_language = st.selectbox(
+                    "Langue pour toutes les attestations de l'archive ZIP",
+                    LANGUES,
+                    index=0,
+                    key=f"bulk_attestation_language_{allowed_dept or 'all'}",
+                    help="La langue choisie s'applique aux copies Word placées dans le ZIP. Les numéros, dates et références déjà attribués sont conservés.",
+                )
+                zip_data, zip_count = _attestations_zip(zip_issued_records, language_mode=bulk_language)
                 zip_label = "tous les départements" if allowed_dept is None else f"département {allowed_dept}"
                 st.download_button(
                     f"📦 Télécharger toutes les attestations Word en ZIP ({zip_count} document(s) — {zip_label})",
@@ -821,7 +886,7 @@ else:
                     use_container_width=True,
                     key=f"zip_attestations_{allowed_dept or 'all'}",
                 )
-                st.caption("L'archive comprend uniquement les attestations déjà émises avec numéro et date officiels. Les demandes en attente restent à compléter avant de pouvoir produire une attestation.")
+                st.caption("L'archive contient toutes les attestations déjà émises pour le périmètre autorisé, dans la langue sélectionnée. Chaque document conserve son numéro officiel, sa date de délivrance et sa référence ; le téléchargement groupé ne consomme pas de nouveaux numéros. Les demandes en attente doivent d'abord être complétées et émises.")
             else:
                 st.info("Aucune attestation finalisée à inclure dans l'archive pour ce périmètre.")
             if not issued:
