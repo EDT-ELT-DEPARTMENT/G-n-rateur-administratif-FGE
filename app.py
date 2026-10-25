@@ -20,7 +20,10 @@ import pandas as pd
 import streamlit as st
 
 from attestation_generator import DEPARTEMENTS, generate_attestation
-from storage import backend_mode, create_request, get_request, get_setting, issue_request, list_requests
+from storage import (
+    backend_mode, create_request, get_request, get_setting, issue_request, list_requests,
+    save_generation_file, list_generation_files, get_generation_file, delete_all_request_history,
+)
 from edt_individuel import (
     export_timetable_html, export_timetable_pdf, export_timetable_xlsx,
     load_edt_sessions, match_teacher_sessions, timetable_grid_records,
@@ -221,6 +224,68 @@ def _safe_filename(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "")).strip("_") or "Personnel"
 
 
+def _archive_docx_record(record: dict, language_mode: str | None = None, content: bytes | None = None) -> dict:
+    """Sauvegarde une version Word générée dans archives_generations/ et dans le backend."""
+    values = values_from_record(record)
+    language_mode = language_mode or store_language_mode(record)
+    if content is None:
+        content = generate_attestation(values, language_mode)
+    number = str(record.get("attestation_number") or values.get("numero") or "SansNumero")
+    year = int(record.get("issued_year") or datetime.now(TZ_ALGERIA).year)
+    request_id = str(record.get("id", ""))
+    lang_tag = {LANGUES[0]: "Bilingue", LANGUES[1]: "Arabe", LANGUES[2]: "Francais"}.get(language_mode, "Document")
+    safe_name = _safe_filename(f"{values.get('nom','')}_{values.get('prenom','')}")
+    department = str(values.get("department", record.get("department", "")))
+    filename = f"Attestation_{safe_name}_{_safe_filename(department)}_{number}_{year}_{lang_tag}.docx"
+    archive_key = f"docx:{request_id}:{year}:{number}:{lang_tag}"
+    try:
+        result = save_generation_file(
+            archive_key, filename, content,
+            department=department,
+            person_name=f"{values.get('prenom','')} {values.get('nom','')}".strip(),
+            attestation_number=number,
+            issued_year=year,
+            language_mode=language_mode,
+            file_kind="DOCX",
+        )
+        if not result.get("persistent", False):
+            st.session_state["archive_save_notice"] = (
+                "Le document Word a été généré, mais la sauvegarde persistante n'est pas disponible. "
+                "Vérifiez le dossier local ou le schéma SQL des archives dans Supabase."
+            )
+        return result
+    except Exception as exc:
+        # Une erreur d'archivage ne doit pas invalider une attestation déjà émise.
+        st.session_state["archive_save_notice"] = f"Attestation générée, mais erreur de sauvegarde des archives : {exc}"
+        return {"persistent": False, "error": str(exc)}
+
+
+def _archive_zip_file(content: bytes, file_name: str, records: list[dict], language_modes: list[str], file_kind: str = "ZIP") -> dict:
+    departments = sorted({str(r.get("department", "")) for r in records if r.get("department")})
+    department = departments[0] if len(departments) == 1 else "Tous les départements"
+    record_ids = sorted(str(r.get("id", "")) for r in records)
+    fingerprint_source = "|".join(record_ids) + "::" + "|".join(language_modes) + "::" + file_name
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:24]
+    years = [int(r.get("issued_year")) for r in records if str(r.get("issued_year", "")).isdigit()]
+    issue_year = max(years) if years else datetime.now(TZ_ALGERIA).year
+    try:
+        result = save_generation_file(
+            f"zip:{fingerprint}", file_name, content,
+            department=department,
+            person_name=f"Archive groupée ({len(records)} attestations)",
+            attestation_number="",
+            issued_year=issue_year,
+            language_mode=", ".join(language_modes),
+            file_kind=file_kind,
+        )
+        if not result.get("persistent", False):
+            st.session_state["archive_save_notice"] = "Le ZIP est prêt, mais sa sauvegarde cloud n'a pas abouti. Vérifiez le schéma SQL des archives."
+        return result
+    except Exception as exc:
+        st.session_state["archive_save_notice"] = f"ZIP prêt, mais erreur de sauvegarde : {exc}"
+        return {"persistent": False, "error": str(exc)}
+
+
 def _edt_subjects_grouped_by_type(sessions: list[dict]) -> tuple[list[str], str]:
     """Retourne les matières uniques groupées par type d'enseignement tiré de l'EDT.
 
@@ -292,7 +357,7 @@ def _build_source_snapshot(person: dict, source_name: str, edt_sessions: list[di
     }
 
 
-def _attestations_zip(records: list[dict], language_modes: list[str] | None = None) -> tuple[bytes, int]:
+def _attestations_zip(records: list[dict], language_modes: list[str] | None = None, *, save_to_archive: bool = False) -> tuple[bytes, int]:
     """Regroupe les attestations déjà émises dans un ou plusieurs formats de langue.
 
     Chaque copie reprend le même numéro, la même date et la même référence officielle.
@@ -327,6 +392,11 @@ def _attestations_zip(records: list[dict], language_modes: list[str] | None = No
                     filename = f"{base}_{str(record.get('id',''))[:8]}_{language_suffix.get(language_mode, 'Document')}.docx"
                 used_names.add(filename)
                 archive.writestr(filename, docx)
+                # L'archivage persistant est déclenché explicitement ou lors d'une génération officielle en lot.
+                if save_to_archive:
+                    archived_doc = _archive_docx_record(record, language_mode, content=docx)
+                    if not archived_doc.get("persistent", False):
+                        st.session_state["archive_save_notice"] = "Une copie Word a été générée, mais n'a pas pu être conservée dans le stockage persistant. Vérifiez le schéma SQL des archives."
                 count += 1
         archive.writestr(
             "LISEZ-MOI.txt",
@@ -336,7 +406,19 @@ def _attestations_zip(records: list[dict], language_modes: list[str] | None = No
             f"Nombre de fichiers Word : {count}\n"
             "Les versions linguistiques d'une même attestation conservent le numéro, la date et la référence déjà attribués.\n",
         )
-    return out.getvalue(), count
+    zip_content = out.getvalue()
+    if count and save_to_archive:
+        dept_name = "Tous_Departements" if len({r.get("department") for r in records if r.get("department")}) != 1 else _safe_filename(next(iter({r.get("department") for r in records if r.get("department")})))
+        language_label = "_".join({LANGUES[0]: "Bilingue", LANGUES[1]: "Arabe", LANGUES[2]: "Francais"}[item] for item in selected_modes)
+        archive_name = f"Attestations_{dept_name}_{language_label}.zip"
+        try:
+            saved_zip = _archive_zip_file(zip_content, archive_name, records, selected_modes, file_kind="ZIP attestations")
+            if not saved_zip.get("persistent", False):
+                st.session_state["archive_save_notice"] = "Le ZIP a été préparé mais sa sauvegarde cloud a échoué. Vérifiez la migration SQL des archives."
+        except Exception as exc:
+            # Le téléchargement principal ne doit pas échouer à cause du stockage d'archives.
+            st.session_state["archive_save_notice"] = f"ZIP généré, mais sa sauvegarde a rencontré une erreur : {exc}"
+    return zip_content, count
 
 
 def _department_from_source(value: str) -> str | None:
@@ -1311,7 +1393,7 @@ else:
                                 progress.progress(index / max(1, len(rows_to_process)), text=f"Traitement {index}/{len(rows_to_process)} : {person.get('full_name_fr','')}")
                             progress.empty()
                             if records_for_zip:
-                                zip_data, files_count = _attestations_zip(list(records_for_zip.values()), language_modes=bulk_languages)
+                                zip_data, files_count = _attestations_zip(list(records_for_zip.values()), language_modes=bulk_languages, save_to_archive=True)
                                 st.success(f"Lot terminé : {newly_issued} nouvelle(s) émission(s), {reused_issued} attestation(s) déjà émises réutilisée(s), {len(failed)} échec(s). {files_count} document(s) Word dans le ZIP.")
                                 if failed:
                                     with st.expander("Détails des échecs", expanded=False):
@@ -1461,6 +1543,9 @@ else:
                                 docx_bytes = generate_attestation(values, store_language_mode(issued_record))
                                 safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{values['nom']}_{values['prenom']}").strip("_") or "Personnel"
                                 filename = f"Attestation_{safe_name}_{values['department']}_{values['numero']}_{issued_record.get('issued_year','')}.docx"
+                                archive_result = _archive_docx_record(issued_record, store_language_mode(issued_record), content=docx_bytes)
+                                if not archive_result.get("persistent", False):
+                                    st.session_state["archive_save_notice"] = "Le document est généré et sauvegardé localement, mais l'archive cloud n'a pas pu être enregistrée. Vérifiez la migration SQL des archives."
                                 st.session_state["last_issued_document"] = {
                                     "request_id": selected_id,
                                     "bytes": docx_bytes,
@@ -1507,6 +1592,15 @@ else:
                         key=f"zip_attestations_{allowed_dept or 'all'}",
                     )
                     st.caption("Pour chaque attestation déjà émise, l'archive contient une copie pour chaque langue choisie. Les numéros, dates et références ne sont pas réattribués. Les demandes encore en attente doivent d'abord être complétées et validées par le chef.")
+                    if st.button("💾 Sauvegarder ces versions et ce ZIP dans le dossier d'archives", key=f"save_multilang_archive_{allowed_dept or 'all'}"):
+                        try:
+                            _saved_zip_data, _saved_zip_count = _attestations_zip(
+                                zip_issued_records, language_modes=bulk_languages, save_to_archive=True
+                            )
+                            st.session_state["archive_saved_notice"] = f"{_saved_zip_count} document(s) Word et le ZIP ont été enregistrés dans les archives."
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"La sauvegarde a échoué : {exc}")
             else:
                 st.info("Aucune attestation finalisée à inclure dans l'archive pour ce périmètre.")
             if not issued:
@@ -1523,6 +1617,158 @@ else:
                     gv = values_from_record(gen_record)
                     st.write(f"**Numéro :** {gv.get('numero')} / {gen_record.get('issued_year')} · **Date :** {gv.get('date_attestation')}")
                     render_download(gen_record, f"redownload_issued_{generated_id}")
+                    if st.button("💾 Sauvegarder cette attestation dans le dossier d'archives", key=f"archive_single_issued_{generated_id}"):
+                        try:
+                            chosen_language = store_language_mode(gen_record)
+                            chosen_values = values_from_record(gen_record)
+                            chosen_docx = generate_attestation(chosen_values, chosen_language)
+                            saved_one = _archive_docx_record(gen_record, chosen_language, content=chosen_docx)
+                            if saved_one.get("persistent", False):
+                                st.success("Attestation enregistrée dans le dossier des générations sauvegardées.")
+                            else:
+                                st.warning("Le fichier est sauvegardé localement, mais pas dans la base persistante. Vérifiez le schéma SQL des archives.")
+                        except Exception as exc:
+                            st.error(f"Impossible d'archiver cette attestation : {exc}")
+
+        # Dossier d'archives indépendant de l'historique des demandes : les Word et ZIP générés y restent sauvegardés.
+        with st.expander("💾 Dossier des générations sauvegardées", expanded=False):
+            st.write("Chaque attestation Word générée et chaque ZIP préparé sont archivés ici. Effacer l'historique des demandes ne supprime pas ce dossier et ne remet pas les numéros à zéro.")
+            if allowed_dept is None:
+                archive_scope_label = st.selectbox(
+                    "Filtrer les archives par département",
+                    ["Tous les départements"] + list(DEPARTEMENTS.keys()),
+                    key="generation_archive_scope_filter",
+                )
+                archive_department_filter = None if archive_scope_label == "Tous les départements" else archive_scope_label
+            else:
+                archive_department_filter = allowed_dept
+                st.caption(f"Archives accessibles pour votre département : {allowed_dept}.")
+            try:
+                saved_files = list_generation_files(department=archive_department_filter, limit=5000)
+            except Exception as exc:
+                saved_files = []
+                st.error(
+                    "Impossible de lire les archives persistantes. Si l'application est sur Streamlit Cloud, "
+                    "exécutez le script supabase_schema.sql mis à jour dans Supabase > SQL Editor. "
+                    f"Détail technique : {exc}"
+                )
+            if saved_files:
+                archive_rows = [{
+                    "Date de sauvegarde": str(item.get("created_at", ""))[:19].replace("T", " "),
+                    "Type": item.get("file_kind", ""),
+                    "Département": item.get("department", ""),
+                    "Personne / lot": item.get("person_name", ""),
+                    "N° officiel": f"{item.get('attestation_number','')}/{item.get('issued_year','')}" if item.get("attestation_number") else "—",
+                    "Langue(s)": item.get("language_mode", ""),
+                    "Fichier": item.get("file_name", ""),
+                    "Taille (Ko)": round((int(item.get("byte_size") or 0) / 1024), 1),
+                } for item in saved_files]
+                st.metric("Fichiers sauvegardés", len(saved_files))
+                st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True)
+                archive_by_id = {str(item["id"]): item for item in saved_files}
+                chosen_archive_id = st.selectbox(
+                    "Choisir un fichier archivé à télécharger",
+                    list(archive_by_id),
+                    format_func=lambda file_id: (
+                        f"{archive_by_id[file_id].get('file_name','')} — "
+                        f"{archive_by_id[file_id].get('person_name','')} — "
+                        f"{archive_by_id[file_id].get('created_at','')[:10]}"
+                    ),
+                    key=f"chosen_saved_generation_{archive_department_filter or 'all'}",
+                )
+                chosen_archive = get_generation_file(chosen_archive_id) if chosen_archive_id else None
+                if chosen_archive and chosen_archive.get("content"):
+                    st.download_button(
+                        "📥 Télécharger le fichier sélectionné",
+                        data=chosen_archive["content"],
+                        file_name=chosen_archive.get("file_name") or "generation.bin",
+                        mime="application/zip" if str(chosen_archive.get("file_kind", "")).upper().startswith("ZIP") else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                        key=f"download_saved_generation_{chosen_archive_id}",
+                    )
+                if st.button("📦 Préparer une sauvegarde ZIP du dossier d'archives", type="secondary", key=f"prepare_generation_archive_zip_{archive_department_filter or 'all'}"):
+                    try:
+                        archive_buf = BytesIO()
+                        with ZipFile(archive_buf, "w", compression=ZIP_DEFLATED) as archive:
+                            added_count = 0
+                            for item in saved_files:
+                                full_item = get_generation_file(str(item["id"]))
+                                if not full_item or not full_item.get("content"):
+                                    continue
+                                dept_folder = _safe_filename(str(item.get("department") or "Sans_Departement"))
+                                year_folder = str(item.get("issued_year") or datetime.now(TZ_ALGERIA).year)
+                                arcname = f"{year_folder}/{dept_folder}/{item.get('file_name') or 'generation.bin'}"
+                                archive.writestr(arcname, full_item["content"])
+                                added_count += 1
+                            archive.writestr(
+                                "LISEZ-MOI.txt",
+                                "Sauvegarde des fichiers générés par l'application d'attestations UDL-SBA.\n"
+                                f"Fichiers inclus : {added_count}.\n"
+                                "Cette archive est indépendante de l'historique des demandes.\n"
+                            )
+                        st.session_state["generation_archive_download"] = {
+                            "content": archive_buf.getvalue(),
+                            "file_name": f"Dossier_Generations_{_safe_filename(archive_scope_label if allowed_dept is None else allowed_dept)}_{datetime.now(TZ_ALGERIA).strftime('%Y%m%d_%H%M%S')}.zip",
+                            "count": added_count,
+                            "scope_key": archive_department_filter or "all",
+                        }
+                    except Exception as exc:
+                        st.error(f"Impossible de préparer la sauvegarde ZIP : {exc}")
+                archive_package = st.session_state.get("generation_archive_download")
+                if archive_package and archive_package.get("scope_key") == (archive_department_filter or "all"):
+                    st.download_button(
+                        f"⬇️ Télécharger la sauvegarde ZIP ({archive_package['count']} fichier(s))",
+                        data=archive_package["content"],
+                        file_name=archive_package["file_name"],
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"download_generation_archive_zip_{archive_package['file_name']}",
+                    )
+            else:
+                st.info("Aucun fichier généré n'est encore archivé pour ce périmètre.")
+            archive_dir_path = APP_DIR / "archives_generations"
+            st.caption(f"Dossier local de sauvegarde : `{archive_dir_path}`. Sur Streamlit Cloud, les fichiers sont également conservés dans la base Supabase après l'installation du schéma SQL mis à jour.")
+
+        # Suppression des demandes : réservée à l'administrateur global, séparée du dossier d'archives.
+        if st.session_state.get("chief_is_master"):
+            with st.expander("⚠️ Zone sensible — Effacer tout l'historique des demandes", expanded=False):
+                st.error(
+                    "Cette action supprime définitivement toutes les demandes (en attente et générées) du registre. "
+                    "Elle NE supprime PAS le dossier des générations sauvegardées et NE remet PAS les numéros officiels à zéro."
+                )
+                confirm_history_clear = st.checkbox(
+                    "J'ai compris que toutes les demandes du registre, dans les quatre départements, seront supprimées.",
+                    key="confirm_clear_all_attestation_history",
+                )
+                confirm_history_text = st.text_input(
+                    "Pour confirmer, saisissez exactement : EFFACER TOUT L'HISTORIQUE",
+                    key="confirm_clear_all_attestation_history_text",
+                )
+                if st.button(
+                    "🗑️ Effacer tout l'historique des demandes",
+                    type="primary",
+                    disabled=not (confirm_history_clear and confirm_history_text.strip() == "EFFACER TOUT L'HISTORIQUE"),
+                    key="clear_all_attestation_history_button",
+                ):
+                    try:
+                        deleted_count = delete_all_request_history()
+                        for session_key in ("last_issued_document", "last_issued_request_id", "generation_archive_download"):
+                            st.session_state.pop(session_key, None)
+                        st.session_state["history_cleared_count_notice"] = deleted_count
+                        st.session_state["confirm_clear_all_attestation_history"] = False
+                        st.session_state["confirm_clear_all_attestation_history_text"] = ""
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"L'historique n'a pas pu être effacé : {exc}")
+        if st.session_state.pop("history_cleared_count_notice", None) is not None:
+            st.success("Historique des demandes effacé. Les archives générées et les compteurs officiels sont conservés.")
+        archive_notice = st.session_state.pop("archive_save_notice", None)
+        if archive_notice:
+            st.warning(archive_notice)
+        archive_saved_notice = st.session_state.pop("archive_saved_notice", None)
+        if archive_saved_notice:
+            st.success(archive_saved_notice)
 
         last_doc = st.session_state.get("last_issued_document")
         if last_doc:

@@ -5,8 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import base64
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from typing import Any
@@ -90,6 +93,23 @@ def _connect() -> sqlite3.Connection:
             issue_year INTEGER PRIMARY KEY,
             last_number INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS attestation_generation_files (
+            id TEXT PRIMARY KEY,
+            archive_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            department TEXT NOT NULL DEFAULT '',
+            person_name TEXT NOT NULL DEFAULT '',
+            attestation_number TEXT NOT NULL DEFAULT '',
+            issued_year INTEGER,
+            language_mode TEXT NOT NULL DEFAULT '',
+            file_kind TEXT NOT NULL DEFAULT 'DOCX',
+            file_name TEXT NOT NULL,
+            byte_size INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL DEFAULT '',
+            content BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS attestation_generation_files_dept_created_idx
+            ON attestation_generation_files(department, created_at DESC);
     """)
     # Migration sans perte pour les bases locales créées avec l'ancienne version.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(attestation_requests)").fetchall()}
@@ -278,6 +298,216 @@ def issue_request(request_id: str, final_data: dict[str, Any]) -> dict[str, Any]
             conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
+        raise
+    finally:
+        conn.close()
+
+
+# -------------------- Archives des générations --------------------
+_ARCHIVE_DIR = APP_DIR / "archives_generations"
+
+
+def _safe_file_component(value: str, fallback: str = "Document") -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", text)
+    text = re.sub(r"\s+", "_", text).strip(" ._")
+    return (text[:150] or fallback)
+
+
+def _local_archive_path(archive_key: str, file_name: str, department: str = "", issued_year: int | None = None) -> Path:
+    year = str(issued_year or now_local().year)
+    dept = _safe_file_component(department or "Sans_departement", "Sans_departement")
+    key_hash = hashlib.sha256(str(archive_key).encode("utf-8")).hexdigest()[:12]
+    filename = _safe_file_component(file_name, "generation.bin")
+    target_dir = _ARCHIVE_DIR / year / dept
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / f"{key_hash}_{filename}"
+
+
+def save_generation_file(
+    archive_key: str,
+    file_name: str,
+    content: bytes,
+    *,
+    department: str = "",
+    person_name: str = "",
+    attestation_number: str = "",
+    issued_year: int | None = None,
+    language_mode: str = "",
+    file_kind: str = "DOCX",
+) -> dict[str, Any]:
+    """Archive un document en local et dans le backend actif.
+
+    En mode Supabase, le contenu est conservé en base pour survivre aux redémarrages
+    de Streamlit Cloud. Le dossier local reste pratique en installation sur serveur/PC.
+    Un archive_key stable met à jour le même document au lieu de multiplier les copies.
+    """
+    if not archive_key or not file_name or not isinstance(content, (bytes, bytearray)):
+        raise ValueError("Clé d'archive, nom du fichier et contenu binaire obligatoires.")
+    payload_bytes = bytes(content)
+    now = now_local().isoformat(timespec="seconds")
+    issued_year = int(issued_year or now_local().year)
+    file_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "udl-attestation-archive:" + archive_key))
+    digest = hashlib.sha256(payload_bytes).hexdigest()
+    local_path: str | None = None
+    try:
+        path = _local_archive_path(archive_key, file_name, department, issued_year)
+        path.write_bytes(payload_bytes)
+        local_path = str(path)
+    except OSError:
+        # Le stockage base peut réussir même si le système de fichiers local est en lecture seule.
+        pass
+
+    try:
+        client = _client()
+    except Exception as exc:
+        return {
+            "id": file_id, "archive_key": str(archive_key), "created_at": now,
+            "department": str(department or ""), "person_name": str(person_name or ""),
+            "attestation_number": str(attestation_number or ""), "issued_year": issued_year,
+            "language_mode": str(language_mode or ""), "file_kind": str(file_kind or "DOCX"),
+            "file_name": _safe_file_component(file_name, "generation.bin"),
+            "byte_size": len(payload_bytes), "sha256": digest, "local_path": local_path,
+            "persistent": False, "error": str(exc),
+        }
+    if client:
+        row = {
+            "id": file_id,
+            "archive_key": str(archive_key),
+            "created_at": now,
+            "department": str(department or ""),
+            "person_name": str(person_name or ""),
+            "attestation_number": str(attestation_number or ""),
+            "issued_year": issued_year,
+            "language_mode": str(language_mode or ""),
+            "file_kind": str(file_kind or "DOCX"),
+            "file_name": _safe_file_component(file_name, "generation.bin"),
+            "byte_size": len(payload_bytes),
+            "sha256": digest,
+            "content_base64": base64.b64encode(payload_bytes).decode("ascii"),
+        }
+        try:
+            client.table("attestation_generation_files").upsert(row, on_conflict="archive_key").execute()
+            return {k: v for k, v in row.items() if k != "content_base64"} | {"local_path": local_path, "persistent": True}
+        except Exception as exc:
+            # Le document existe au minimum dans le dossier local de l'instance.
+            # L'administrateur sera invité à appliquer la migration SQL pour la persistance cloud.
+            return {k: v for k, v in row.items() if k != "content_base64"} | {
+                "local_path": local_path, "persistent": False, "error": str(exc)
+            }
+
+    conn = _connect()
+    try:
+        conn.execute("""INSERT INTO attestation_generation_files
+            (id, archive_key, created_at, department, person_name, attestation_number, issued_year,
+             language_mode, file_kind, file_name, byte_size, sha256, content)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(archive_key) DO UPDATE SET
+             created_at=excluded.created_at, department=excluded.department,
+             person_name=excluded.person_name, attestation_number=excluded.attestation_number,
+             issued_year=excluded.issued_year, language_mode=excluded.language_mode,
+             file_kind=excluded.file_kind, file_name=excluded.file_name,
+             byte_size=excluded.byte_size, sha256=excluded.sha256, content=excluded.content""",
+            (file_id, str(archive_key), now, str(department or ""), str(person_name or ""),
+             str(attestation_number or ""), issued_year, str(language_mode or ""),
+             str(file_kind or "DOCX"), _safe_file_component(file_name, "generation.bin"),
+             len(payload_bytes), digest, sqlite3.Binary(payload_bytes)))
+    finally:
+        conn.close()
+    return {
+        "id": file_id, "archive_key": str(archive_key), "created_at": now,
+        "department": str(department or ""), "person_name": str(person_name or ""),
+        "attestation_number": str(attestation_number or ""), "issued_year": issued_year,
+        "language_mode": str(language_mode or ""), "file_kind": str(file_kind or "DOCX"),
+        "file_name": _safe_file_component(file_name, "generation.bin"),
+        "byte_size": len(payload_bytes), "sha256": digest, "local_path": local_path,
+        "persistent": True,
+    }
+
+
+def list_generation_files(department: str | None = None, limit: int = 1000) -> list[dict[str, Any]]:
+    """Renvoie les métadonnées des générations archivées, sans charger les contenus."""
+    client = _client()
+    if client:
+        query = (client.table("attestation_generation_files")
+                 .select("id,archive_key,created_at,department,person_name,attestation_number,issued_year,language_mode,file_kind,file_name,byte_size,sha256")
+                 .order("created_at", desc=True).limit(int(limit)))
+        if department:
+            query = query.eq("department", department)
+        return query.execute().data or []
+
+    conn = _connect()
+    try:
+        sql = "SELECT id, archive_key, created_at, department, person_name, attestation_number, issued_year, language_mode, file_kind, file_name, byte_size, sha256 FROM attestation_generation_files"
+        params: list[Any] = []
+        if department:
+            sql += " WHERE department = ?"
+            params.append(department)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_generation_file(file_id: str) -> dict[str, Any] | None:
+    """Récupère les métadonnées et le contenu binaire d'une génération archivée."""
+    client = _client()
+    if client:
+        rows = (client.table("attestation_generation_files").select("*")
+                .eq("id", str(file_id)).limit(1).execute().data or [])
+        if not rows:
+            return None
+        row = dict(rows[0])
+        encoded = row.pop("content_base64", "")
+        try:
+            content = base64.b64decode(encoded) if encoded else b""
+        except (ValueError, TypeError):
+            content = b""
+        row["content"] = content
+        return row
+
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM attestation_generation_files WHERE id = ?", (str(file_id),)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["content"] = bytes(data.get("content") or b"")
+        return data
+    finally:
+        conn.close()
+
+
+def delete_all_request_history() -> int:
+    """Supprime toutes les demandes, mais conserve les compteurs et les archives générées."""
+    client = _client()
+    if client:
+        try:
+            result = client.rpc("clear_attestation_history").execute()
+            value = result.data
+            if isinstance(value, list) and value:
+                value = value[0]
+            if isinstance(value, dict):
+                value = value.get("clear_attestation_history", value.get("deleted_count", 0))
+            return int(value or 0)
+        except Exception:
+            # Compatibilité avec un schéma Supabase antérieur à l'ajout de la fonction RPC.
+            count_result = client.table("attestation_requests").select("id", count="exact").execute()
+            count = int(getattr(count_result, "count", 0) or len(count_result.data or []))
+            client.table("attestation_requests").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            return count
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        count = int(conn.execute("SELECT COUNT(*) FROM attestation_requests").fetchone()[0])
+        conn.execute("DELETE FROM attestation_requests")
+        # Ne pas supprimer attestation_sequences : les numéros officiels ne doivent jamais être réutilisés.
+        conn.execute("COMMIT")
+        return count
+    except Exception:
+        conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
