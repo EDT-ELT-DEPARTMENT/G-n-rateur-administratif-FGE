@@ -33,6 +33,7 @@ LANGUES = ["Bilingue (arabe puis français)", "Arabe (conforme au modèle PDF)",
 REFERENCE_PAR_DEFAUT = f"UDL-GEL-ER-120-{datetime.now(TZ_ALGERIA).year}"
 SOURCE_PERSONNEL_FILE = APP_DIR / "Vos coordonnées (réponses).xlsx"
 EDT_SOURCE_FILE = APP_DIR / "EDT_Edition.xlsx"
+ALL_SOURCE_REQUESTERS = "__TOUS_LES_DEMANDEURS__"
 
 # Valeurs de repli demandées. Pour les autres départements, les noms peuvent être
 # définis dans Streamlit Secrets (CHEF_NAME_FR_... et CHEF_NAME_AR_...).
@@ -255,8 +256,56 @@ def _edt_promotions(sessions: list[dict]) -> list[str]:
     return sorted(seen.values(), key=_norm_source_header)
 
 
-def _attestations_zip(records: list[dict], language_mode: str | None = None) -> tuple[bytes, int]:
-    """Regroupe les attestations déjà émises dans la langue choisie, sans réattribuer de numéro."""
+def _build_source_snapshot(person: dict, source_name: str, edt_sessions: list[dict],
+                           matched_teachers: list[str], match_mode: str, edt_source_name: str) -> dict:
+    """Snapshot utile au chef et au générateur pour une personne issue du classeur source."""
+    subjects = unique_subjects(edt_sessions) if edt_sessions else []
+    subjects_with_type, subjects_text = _edt_subjects_grouped_by_type(edt_sessions)
+    promotions = _edt_promotions(edt_sessions)
+    if not edt_sessions:
+        subjects_text = _source_value(person.get("matiere_s1", ""))
+    session_rows = [
+        {k: str(session.get(k, "") or "") for k in
+         ("Enseignements", "Matiere", "Code", "Type", "Enseignants", "Horaire", "Jours", "Lieu", "Promotion", "Département")}
+        for session in edt_sessions
+    ]
+    return {
+        "source_row": person.get("source_row"),
+        "source_file_name": source_name,
+        "source_nom_complet_fr": person.get("full_name_fr", ""),
+        "source_nom_complet_ar": person.get("full_name_ar", ""),
+        "nom_ar": person.get("nom_ar", ""),
+        "prenom_ar": person.get("prenom_ar", ""),
+        "matiere_s1": subjects_text,
+        "edt_subjects_text": subjects_text,
+        "edt_subjects": subjects,
+        "edt_subjects_with_type": subjects_with_type,
+        "edt_promotions": promotions,
+        "edt_promotions_text": ", ".join(promotions),
+        "edt_teacher_names": matched_teachers,
+        "edt_match_mode": match_mode,
+        "edt_source_file": edt_source_name,
+        "edt_session_count": len(edt_sessions),
+        "edt_sessions": session_rows,
+        "type_enseignement": person.get("type_enseignement", ""),
+        "dernier_diplome": person.get("dernier_diplome", ""),
+    }
+
+
+def _attestations_zip(records: list[dict], language_modes: list[str] | None = None) -> tuple[bytes, int]:
+    """Regroupe les attestations déjà émises dans un ou plusieurs formats de langue.
+
+    Chaque copie reprend le même numéro, la même date et la même référence officielle.
+    Le téléchargement ne crée jamais de nouvelle émission.
+    """
+    selected_modes = [mode for mode in (language_modes or [LANGUES[0]]) if mode in LANGUES]
+    if not selected_modes:
+        selected_modes = [LANGUES[0]]
+    language_suffix = {
+        LANGUES[0]: "Bilingue",
+        LANGUES[1]: "Arabe",
+        LANGUES[2]: "Francais",
+    }
     out = BytesIO()
     count = 0
     used_names: set[str] = set()
@@ -267,24 +316,25 @@ def _attestations_zip(records: list[dict], language_mode: str | None = None) -> 
             values = values_from_record(record)
             if not values.get("numero") or not values.get("date_attestation"):
                 continue
-            # La langue choisie pour le lot modifie seulement la copie dans le ZIP.
-            # Le numéro, la date et la référence de l'attestation déjà émise restent inchangés.
-            docx = generate_attestation(values, language_mode or store_language_mode(record))
             base = _safe_filename(
                 f"Attestation_{values.get('nom','')}_{values.get('prenom','')}_"
                 f"{values.get('department','')}_{values['numero']}_{record.get('issued_year','')}"
             )
-            filename = base + ".docx"
-            if filename in used_names:
-                filename = f"{base}_{str(record.get('id',''))[:8]}.docx"
-            used_names.add(filename)
-            archive.writestr(filename, docx)
-            count += 1
+            for language_mode in selected_modes:
+                docx = generate_attestation(values, language_mode)
+                filename = f"{base}_{language_suffix.get(language_mode, 'Document')}.docx"
+                if filename in used_names:
+                    filename = f"{base}_{str(record.get('id',''))[:8]}_{language_suffix.get(language_mode, 'Document')}.docx"
+                used_names.add(filename)
+                archive.writestr(filename, docx)
+                count += 1
         archive.writestr(
             "LISEZ-MOI.txt",
             "Archive des attestations administratives déjà émises.\n"
-            "Les demandes encore en attente sont exclues : elles n'ont pas de numéro officiel ni de document final.\n"
-            f"Nombre de documents : {count}\n",
+            "Les demandes en attente sont exclues : elles doivent être vérifiées et émises par le chef.\n"
+            f"Formats sélectionnés : {', '.join(selected_modes)}\n"
+            f"Nombre de fichiers Word : {count}\n"
+            "Les versions linguistiques d'une même attestation conservent le numéro, la date et la référence déjà attribués.\n",
         )
     return out.getvalue(), count
 
@@ -370,6 +420,48 @@ def send_head_notification(record: dict) -> tuple[bool, str]:
         return True, f"Notification envoyée au chef du département {record['department']}."
     except Exception as exc:
         return False, f"La demande est enregistrée, mais la notification e-mail a échoué : {exc}"
+
+
+def send_head_batch_notification(department: str, count: int) -> tuple[bool, str]:
+    """Envoie un seul avis au chef par département après un dépôt en lot."""
+    suffix = DEPT_SECRET_SUFFIX.get(department, "")
+    recipient = get_setting("CHEF_EMAIL_" + suffix) if suffix else ""
+    host = get_setting("SMTP_HOST")
+    sender = get_setting("SMTP_FROM")
+    if not (recipient and host and sender):
+        return False, "Notification e-mail non configurée."
+    try:
+        port = int(get_setting("SMTP_PORT", "587") or "587")
+        msg = EmailMessage()
+        msg["Subject"] = f"Demandes groupées d'attestation — {department}"
+        msg["From"] = sender
+        msg["To"] = recipient
+        app_url = get_setting("PUBLIC_APP_URL")
+        app_line = f"\nOuvrir l'application : {app_url}\n" if app_url else ""
+        msg.set_content(
+            f"{count} demande(s) d'attestation administrative ont été ajoutées à la file du département {department}.\n\n"
+            "Aucune identité n'est incluse dans ce courriel. Connectez-vous à l'espace sécurisé pour vérifier et traiter les dossiers.\n"
+            + app_line
+        )
+        username = get_setting("SMTP_USER")
+        password = get_setting("SMTP_PASSWORD")
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context()) as server:
+                if username:
+                    server.login(username, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.ehlo()
+                if port in (587, 25):
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                if username:
+                    server.login(username, password)
+                server.send_message(msg)
+        return True, "Notification groupée envoyée."
+    except Exception as exc:
+        return False, f"Notification groupée non envoyée : {exc}"
 
 
 def label_request(row: dict) -> str:
@@ -476,16 +568,158 @@ if role == "Déposer une demande":
             st.error(f"Impossible de lire le fichier source : {exc}")
 
     if source_people:
+        def _format_source_person(choice):
+            if choice == ALL_SOURCE_REQUESTERS:
+                return "🌐 Tous les demandeurs — préparer les demandes en lot"
+            person = source_people[int(choice)]
+            return person["full_name_fr"] + (f" — {person['full_name_ar']}" if person.get("full_name_ar") else "")
+
         selected_source_idx = st.selectbox(
             "👤 Sélectionner le demandeur dans le fichier source *",
-            options=list(range(len(source_people))),
-            format_func=lambda idx: (
-                source_people[idx]["full_name_fr"] +
-                (f" — {source_people[idx]['full_name_ar']}" if source_people[idx].get("full_name_ar") else "")
-            ),
+            options=[ALL_SOURCE_REQUESTERS] + [str(idx) for idx in range(len(source_people))],
+            index=1,
+            format_func=_format_source_person,
             key="source_person_selection",
-            help="La sélection remplit automatiquement les champs disponibles ci-dessous. Les champs restent modifiables pour corriger une éventuelle erreur de saisie source.",
+            help="Choisissez une personne pour déposer une demande individuelle, ou « Tous les demandeurs » pour préparer les demandes du fichier en une seule opération. La génération officielle reste soumise à la vérification et aux compléments du chef.",
         )
+
+        if selected_source_idx == ALL_SOURCE_REQUESTERS:
+            st.markdown("### 📚 Préparer les demandes de tous les demandeurs")
+            st.warning(
+                "Le fichier source ne contient pas de colonne Département. Pour éviter d'envoyer une demande au mauvais chef, "
+                "attribuez un département à chaque personne dans le tableau. Cette opération crée des demandes **en attente** ; "
+                "le chef devra compléter et valider les informations administratives avant l'émission officielle."
+            )
+            admin_pwd_configured = get_setting("ADMIN_PASSWORD")
+            if not admin_pwd_configured:
+                st.error("L'envoi groupé est désactivé tant que le secret ADMIN_PASSWORD n'est pas configuré dans Streamlit Secrets.")
+            batch_df = pd.DataFrame({
+                "Ligne source": [int(person.get("source_row", i + 2)) for i, person in enumerate(source_people)],
+                "Demandeur": [person.get("full_name_fr", "") for person in source_people],
+                "Département": [
+                    _department_from_source(person.get("source_department", "")) or "— Choisir —"
+                    for person in source_people
+                ],
+            })
+            department_choices = ["— Choisir —"] + list(DEPARTEMENTS.keys())
+            with st.form("form_demandes_groupes_source", clear_on_submit=False):
+                edited_batch = st.data_editor(
+                    batch_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    column_config={
+                        "Ligne source": st.column_config.NumberColumn("Ligne source", disabled=True, width="small"),
+                        "Demandeur": st.column_config.TextColumn("Demandeur", disabled=True, width="large"),
+                        "Département": st.column_config.SelectboxColumn("Département à associer", options=department_choices, required=True, width="medium"),
+                    },
+                    key="bulk_source_department_editor",
+                )
+                bulk_default_language = st.selectbox("Langue par défaut des demandes", LANGUES, index=0, key="bulk_source_language")
+                bulk_admin_password = st.text_input("Mot de passe administrateur pour autoriser l'envoi groupé", type="password", key="bulk_source_admin_password")
+                bulk_confirm = st.checkbox("Je confirme vouloir créer une demande en attente pour chaque personne de ce tableau.", key="bulk_source_confirm")
+                submit_bulk_source = st.form_submit_button("📨 Préparer toutes les demandes", type="primary", use_container_width=True)
+            if submit_bulk_source:
+                if not admin_pwd_configured or not hmac.compare_digest(bulk_admin_password or "", admin_pwd_configured):
+                    st.error("Mot de passe administrateur incorrect ou non configuré. Aucune demande n'a été créée.")
+                elif not bulk_confirm:
+                    st.error("Cochez la confirmation avant de créer les demandes groupées.")
+                else:
+                    missing_depts = edited_batch[edited_batch["Département"].isin(["— Choisir —", "", None])]
+                    if not missing_depts.empty:
+                        st.error("Choisissez un département pour chaque personne avant de continuer : " + ", ".join(missing_depts["Demandeur"].astype(str).tolist()))
+                    else:
+                        # Charge l'EDT une seule fois pour alimenter chaque dossier de façon cohérente.
+                        edt_all_for_batch = []
+                        edt_batch_name = ""
+                        if EDT_SOURCE_FILE.exists():
+                            try:
+                                edt_batch_name = EDT_SOURCE_FILE.name
+                                edt_all_for_batch = _load_edt_cached(EDT_SOURCE_FILE.read_bytes())
+                            except Exception as exc:
+                                st.warning(f"Le classeur EDT n'a pas pu être utilisé pour le lot : {exc}")
+                        try:
+                            existing_requests = list_requests(limit=10000)
+                        except Exception:
+                            existing_requests = []
+                        existing_sources = []
+                        for old_request in existing_requests:
+                            old_snapshot = old_request.get("source_snapshot") or {}
+                            existing_sources.append((
+                                str(old_snapshot.get("source_row", "")),
+                                _norm_source_header(old_snapshot.get("source_nom_complet_fr", "")),
+                                str(old_snapshot.get("source_file_name", "")),
+                            ))
+                        created_count, duplicate_count, failed = 0, 0, []
+                        created_by_department: dict[str, int] = {}
+                        dept_by_source_row = {int(row["Ligne source"]): str(row["Département"]) for _, row in edited_batch.iterrows()}
+                        for person in source_people:
+                            source_row_no = int(person.get("source_row", 0))
+                            dept_value = dept_by_source_row.get(source_row_no, "— Choisir —")
+                            identity_key = _norm_source_header(person.get("full_name_fr", ""))
+                            is_duplicate = any(
+                                old_row == str(source_row_no)
+                                and old_name == identity_key
+                                and (not old_file or old_file == source_name)
+                                for old_row, old_name, old_file in existing_sources
+                            )
+                            if is_duplicate:
+                                duplicate_count += 1
+                                continue
+                            dob = clean_date_input(person.get("date_naissance", ""))
+                            birthplace = _source_value(person.get("lieu_naissance", ""))
+                            if not (person.get("nom") and person.get("prenom") and dob and birthplace):
+                                failed.append(f"{person.get('full_name_fr','')} (identité ou date/lieu de naissance incomplet)")
+                                continue
+                            person_sessions, matched_names, match_mode = ([], [], "aucun")
+                            if edt_all_for_batch:
+                                try:
+                                    person_sessions, matched_names, match_mode = match_teacher_sessions(person.get("full_name_fr", ""), edt_all_for_batch)
+                                except Exception:
+                                    person_sessions, matched_names, match_mode = ([], [], "aucun")
+                            snapshot = _build_source_snapshot(person, source_name, person_sessions, matched_names, match_mode, edt_batch_name)
+                            try:
+                                record = create_request({
+                                    "department": dept_value,
+                                    "nom": person["nom"],
+                                    "prenom": person["prenom"],
+                                    "date_naissance": dob,
+                                    "lieu_naissance": birthplace,
+                                    "email": person.get("email", ""),
+                                    "telephone": person.get("telephone", ""),
+                                    "purpose": "Demande préparée en lot depuis le fichier source du personnel.",
+                                    "language_mode": bulk_default_language,
+                                    "source_snapshot": snapshot,
+                                })
+                                created_count += 1
+                                created_by_department[dept_value] = created_by_department.get(dept_value, 0) + 1
+                            except Exception as exc:
+                                failed.append(f"{person.get('full_name_fr','')}: {exc}")
+                        notifications = []
+                        for dept_name, dept_count in created_by_department.items():
+                            ok, notice = send_head_batch_notification(dept_name, dept_count)
+                            if notice and ok:
+                                notifications.append(f"{dept_name} : notification envoyée")
+                        st.session_state["bulk_source_request_result"] = {
+                            "created": created_count, "duplicates": duplicate_count, "failed": failed,
+                            "notifications": notifications,
+                        }
+                        st.rerun()
+            result = st.session_state.get("bulk_source_request_result")
+            if result:
+                st.success(f"Lot terminé : {result['created']} demande(s) créée(s), {result['duplicates']} déjà existante(s) ignorée(s), {len(result['failed'])} erreur(s).")
+                if result["failed"]:
+                    with st.expander("Voir les lignes non créées"):
+                        st.write("\n".join(result["failed"]))
+                if result.get("notifications"):
+                    st.caption(" · ".join(result["notifications"]))
+                if st.button("Effacer le bilan du lot", key="clear_bulk_source_result"):
+                    st.session_state.pop("bulk_source_request_result", None)
+                    st.rerun()
+            st.info("Étape suivante : connectez-vous dans « Espace chef de département » pour compléter chaque demande. Quand les attestations sont émises, utilisez l'archive ZIP et sélectionnez un ou plusieurs formats de langue.")
+            st.stop()
+
+        selected_source_idx = int(selected_source_idx)
         selected_person = source_people[selected_source_idx]
 
         # L'EDT est lu depuis le fichier placé dans le dépôt GitHub, nommé exactement EDT_Edition.xlsx.
@@ -617,6 +851,7 @@ if role == "Déposer une demande":
                 try:
                     source_snapshot = {
                         "source_row": selected_person.get("source_row"),
+                        "source_file_name": source_name,
                         "source_nom_complet_fr": selected_person.get("full_name_fr", ""),
                         "source_nom_complet_ar": " ".join(part for part in (nom_ar_req.strip(), prenom_ar_req.strip()) if part),
                         "nom_ar": nom_ar_req.strip(),
@@ -717,6 +952,387 @@ else:
         m1.metric("Demandes en attente", len(pending))
         m2.metric("Attestations générées", len(issued))
         m3.metric("Département", dept_filter or "Tous")
+
+        # Émission groupée administrative depuis les fichiers sources, même sans demande individuelle.
+        with st.expander("⚡ Génération directe en lot depuis le fichier source — sans demande préalable", expanded=False):
+            st.warning(
+                "Cette fonction émet des attestations officielles au nom du chef de département, même si l'enseignant "
+                "n'a pas déposé de demande. Vérifiez les identités, le département, les données EDT et les informations "
+                "communes avant de confirmer. Les champs inconnus resteront vides dans le document plutôt que d'être inventés."
+            )
+            if allowed_dept is None:
+                generation_scope = st.selectbox(
+                    "Périmètre de génération",
+                    ["Tous les départements"] + list(DEPARTEMENTS.keys()),
+                    index=0,
+                    key="direct_source_generation_scope",
+                    help="Pour tous les départements, le département est déduit des séances EDT quand cela est possible ; les cas ambigus doivent être attribués manuellement."
+                )
+            else:
+                generation_scope = allowed_dept
+                st.info(f"Votre compte de chef est limité au département **{allowed_dept}**. Seuls les enseignants qui peuvent être associés à ce département seront proposés.")
+
+            source_people_batch = []
+            batch_source_name = SOURCE_PERSONNEL_FILE.name
+            batch_edt_name = EDT_SOURCE_FILE.name
+            try:
+                if SOURCE_PERSONNEL_FILE.exists():
+                    source_people_batch = _load_source_people(SOURCE_PERSONNEL_FILE.read_bytes())
+                else:
+                    uploaded_batch_source = st.file_uploader(
+                        "Téléverser le fichier source du personnel (.xlsx)", type=["xlsx"], key="direct_batch_source_upload"
+                    )
+                    if uploaded_batch_source is not None:
+                        batch_source_name = uploaded_batch_source.name
+                        source_people_batch = _load_source_people(uploaded_batch_source.getvalue())
+                if EDT_SOURCE_FILE.exists():
+                    batch_edt_sessions = _load_edt_cached(EDT_SOURCE_FILE.read_bytes())
+                else:
+                    uploaded_batch_edt = st.file_uploader(
+                        "Téléverser le fichier EDT_Edition.xlsx", type=["xlsx"], key="direct_batch_edt_upload"
+                    )
+                    batch_edt_sessions = _load_edt_cached(uploaded_batch_edt.getvalue()) if uploaded_batch_edt is not None else []
+                    if uploaded_batch_edt is not None:
+                        batch_edt_name = uploaded_batch_edt.name
+            except Exception as exc:
+                source_people_batch, batch_edt_sessions = [], []
+                st.error(f"Impossible de charger les fichiers sources : {exc}")
+
+            if not source_people_batch:
+                st.info("Le fichier source des coordonnées est absent ou ne contient aucune personne. Placez 'Vos coordonnées (réponses).xlsx' à côté de app.py.")
+            elif not batch_edt_sessions:
+                st.error("Le fichier EDT_Edition.xlsx est nécessaire pour associer les enseignants et proposer leur département. Aucun document n'a été généré.")
+            else:
+                try:
+                    existing_source_records = list_requests(limit=10000)
+                except Exception as exc:
+                    st.error(f"Impossible de lire le registre des attestations : {exc}. La génération directe est bloquée pour éviter de créer des numéros ou dossiers en double.")
+                    st.stop()
+
+                # Réunir les demandes existantes par ligne/source afin de ne pas créer de doublons.
+                existing_for_source: dict[int, list[dict]] = {}
+                for old_record in existing_source_records:
+                    old_snap = old_record.get("source_snapshot") or {}
+                    old_row = old_snap.get("source_row")
+                    try:
+                        old_row_int = int(old_row)
+                    except (TypeError, ValueError):
+                        continue
+                    old_file = _source_value(old_snap.get("source_file_name", ""))
+                    if old_file and _norm_source_header(old_file) != _norm_source_header(batch_source_name):
+                        continue
+                    existing_for_source.setdefault(old_row_int, []).append(old_record)
+
+                candidate_by_row: dict[int, dict] = {}
+                candidate_rows: list[dict] = []
+                ambiguous_count = 0
+                for person in source_people_batch:
+                    try:
+                        source_row_no = int(person.get("source_row", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    sessions, matched_names, match_mode = match_teacher_sessions(person.get("full_name_fr", ""), batch_edt_sessions)
+                    session_departments = sorted({
+                        mapped for mapped in (_department_from_source(s.get("Département", "")) for s in sessions) if mapped
+                    })
+                    declared_department = _department_from_source(person.get("source_department", ""))
+                    if declared_department:
+                        suggested_department = declared_department
+                        dept_method = "Source personnel"
+                    elif len(session_departments) == 1:
+                        suggested_department = session_departments[0]
+                        dept_method = "Département EDT unique"
+                    else:
+                        suggested_department = ""
+                        dept_method = "À vérifier manuellement" if len(session_departments) > 1 else "Aucune correspondance EDT"
+
+                    if allowed_dept is not None:
+                        # Un chef de département ne peut émettre que pour des personnes affectées
+                        # à son département dans la source ou ayant des séances dans ce département.
+                        if declared_department and declared_department != allowed_dept:
+                            continue
+                        if allowed_dept not in session_departments and declared_department != allowed_dept:
+                            continue
+                        assigned_for_table = allowed_dept
+                    elif generation_scope != "Tous les départements":
+                        target_dept = generation_scope
+                        if declared_department and declared_department != target_dept:
+                            continue
+                        if not declared_department and target_dept not in session_departments:
+                            continue
+                        assigned_for_table = target_dept
+                    else:
+                        assigned_for_table = suggested_department
+                        if not assigned_for_table:
+                            ambiguous_count += 1
+
+                    matching_existing = existing_for_source.get(source_row_no, [])
+                    generated_same_source = [r for r in matching_existing if r.get("status") == "Générée" and r.get("attestation_number") not in (None, "")]
+                    if generated_same_source:
+                        status_label = "Déjà émise — numéro conservé"
+                    elif matching_existing:
+                        status_label = "Demande existante — peut être finalisée"
+                    else:
+                        status_label = "À générer"
+                    date_ok = bool(clean_date_input(person.get("date_naissance", "")) or clean_date_input(_normalize_source_date(person.get("date_naissance", ""))))
+                    identity_ok = bool(person.get("nom") and person.get("prenom") and date_ok and person.get("lieu_naissance"))
+                    match_label = f"{match_mode} — {len(sessions)} séance(s)"
+                    if match_mode == "approximatif":
+                        match_label += " (à vérifier)"
+                    candidate_by_row[source_row_no] = {
+                        "person": person,
+                        "sessions": sessions,
+                        "matched_names": matched_names,
+                        "match_mode": match_mode,
+                        "session_departments": session_departments,
+                        "suggested_department": suggested_department,
+                        "department_method": dept_method,
+                        "existing_records": matching_existing,
+                        "identity_ok": identity_ok,
+                    }
+                    candidate_rows.append({
+                        "Ligne source": source_row_no,
+                        "Enseignant (fichier source)": person.get("full_name_fr", ""),
+                        "Département à attribuer": assigned_for_table or "— Choisir —",
+                        "Association EDT": match_label,
+                        "Identité complète": "Oui" if identity_ok else "Non — à vérifier",
+                        "État du registre": status_label,
+                    })
+
+                if allowed_dept is not None:
+                    st.caption("La liste est limitée aux enseignants pour lesquels le département courant est indiqué dans la source ou retrouvé dans les séances EDT. Les enseignants sans rattachement fiable ne sont pas générés par ce compte.")
+                elif generation_scope != "Tous les départements":
+                    st.caption(f"La liste ci-dessous concerne les enseignants associés au département {generation_scope}. Les personnes sans rattachement EDT à ce département sont exclues.")
+                else:
+                    st.caption("Le fichier de coordonnées ne comporte pas de colonne Département. Les départements uniques détectés dans l'EDT sont proposés automatiquement ; pour les cas ambigus ou sans séance, attribuez le département dans la colonne avant de générer.")
+
+                if candidate_rows:
+                    batch_table = pd.DataFrame(candidate_rows)
+                    scope_key = re.sub(r"[^A-Za-z0-9]+", "_", generation_scope).strip("_")
+                    if allowed_dept is None and generation_scope == "Tous les départements":
+                        edited_batch_table = st.data_editor(
+                            batch_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            num_rows="fixed",
+                            key=f"direct_batch_assignment_{scope_key}",
+                            column_config={
+                                "Ligne source": st.column_config.NumberColumn("Ligne source", disabled=True, width="small"),
+                                "Enseignant (fichier source)": st.column_config.TextColumn(disabled=True, width="large"),
+                                "Département à attribuer": st.column_config.SelectboxColumn(
+                                    options=["— Choisir —"] + list(DEPARTEMENTS.keys()), required=True, width="medium"
+                                ),
+                                "Association EDT": st.column_config.TextColumn(disabled=True, width="medium"),
+                                "Identité complète": st.column_config.TextColumn(disabled=True, width="medium"),
+                                "État du registre": st.column_config.TextColumn(disabled=True, width="medium"),
+                            },
+                        )
+                    else:
+                        st.dataframe(batch_table, use_container_width=True, hide_index=True)
+                        edited_batch_table = batch_table
+                    st.caption(f"{len(edited_batch_table)} personne(s) proposées · {ambiguous_count} attribution(s) initialement ambiguë(s) dans la portée globale.")
+
+                    # Champs administratifs communs du lot. Les matières/promotions S1 sont
+                    # individualisées depuis l'EDT ; les valeurs S2 ci-dessous sont communes si renseignées.
+                    batch_departments = list(DEPARTEMENTS.keys()) if generation_scope == "Tous les départements" and allowed_dept is None else [generation_scope if allowed_dept is None else allowed_dept]
+                    batch_chef_defaults = {dept: _chef_par_defaut(dept) for dept in batch_departments}
+                    with st.form(f"form_direct_generation_{scope_key}", clear_on_submit=False):
+                        st.markdown("#### Formats de l'attestation à inclure")
+                        bulk_languages = st.multiselect(
+                            "Type(s) d'attestation à générer",
+                            LANGUES,
+                            default=[LANGUES[0]],
+                            key=f"direct_batch_languages_{scope_key}",
+                            help="Une seule attestation officielle et un seul numéro sont attribués par personne ; chaque langue sélectionnée produit une copie dans le ZIP avec le même numéro et la même date."
+                        )
+                        bulk_reference = st.text_input("Référence administrative à inscrire", value=REFERENCE_PAR_DEFAUT, key=f"direct_batch_ref_{scope_key}")
+                        st.markdown("#### Informations de période communes (facultatives)")
+                        st.caption("Les matières et promotions du semestre 1 restent propres à chaque enseignant et sont importées depuis EDT_Edition.xlsx. Les valeurs S2 saisies ici sont répétées dans chaque document du lot ; laissez-les vides si elles ne sont pas identiques pour tous.")
+                        b1, b2 = st.columns(2)
+                        with b1:
+                            batch_s1_start = st.text_input("Début S1 (JJ/MM/AAAA)", key=f"direct_batch_s1_start_{scope_key}")
+                            batch_s1_end = st.text_input("Fin S1 (JJ/MM/AAAA)", key=f"direct_batch_s1_end_{scope_key}")
+                            batch_s1_year = st.text_input("Année universitaire S1", value=f"{date.today().year}/{date.today().year + 1}", key=f"direct_batch_s1_year_{scope_key}")
+                        with b2:
+                            batch_s2_subjects = st.text_area("Matière(s) S2 commune(s) — facultatif", key=f"direct_batch_s2_subjects_{scope_key}", height=68)
+                            batch_s2_start = st.text_input("Début S2 (JJ/MM/AAAA)", key=f"direct_batch_s2_start_{scope_key}")
+                            batch_s2_end = st.text_input("Fin S2 (JJ/MM/AAAA)", key=f"direct_batch_s2_end_{scope_key}")
+                            batch_s2_promotions = st.text_input("Promotion(s) S2 commune(s) — facultatif", key=f"direct_batch_s2_promotions_{scope_key}")
+                            batch_s2_year = st.text_input("Année universitaire S2", value=f"{date.today().year}/{date.today().year + 1}", key=f"direct_batch_s2_year_{scope_key}")
+                        chef_fields: dict[str, tuple[str, str]] = {}
+                        st.markdown("#### Signataires des départements concernés")
+                        for dept in batch_departments:
+                            default_fr, default_ar = batch_chef_defaults[dept]
+                            if len(batch_departments) > 1:
+                                st.markdown(f"**{dept}**")
+                            cc1, cc2 = st.columns(2)
+                            with cc1:
+                                chef_fr_value = st.text_input("Nom du chef (français)" + (" *" if len(batch_departments) == 1 else " * pour les attestations de ce département"), value=default_fr, key=f"direct_batch_chef_fr_{scope_key}_{DEPT_SECRET_SUFFIX[dept]}")
+                            with cc2:
+                                chef_ar_value = st.text_input("Nom du chef (arabe)" + (" *" if len(batch_departments) == 1 else " * pour les attestations de ce département"), value=default_ar, key=f"direct_batch_chef_ar_{scope_key}_{DEPT_SECRET_SUFFIX[dept]}")
+                            chef_fields[dept] = (chef_fr_value.strip(), chef_ar_value.strip())
+                        confirm_direct_batch = st.checkbox(
+                            "Je confirme que le chef de département autorise cette émission groupée sans demande individuelle et que les identités, les rapprochements EDT et les départements ont été vérifiés.",
+                            key=f"direct_batch_confirm_{scope_key}"
+                        )
+                        direct_batch_submit = st.form_submit_button("📦 Générer les attestations et télécharger le ZIP", type="primary", use_container_width=True)
+
+                    if direct_batch_submit:
+                        errors: list[str] = []
+                        if not bulk_languages:
+                            errors.append("Choisissez au moins une langue : arabe, français ou bilingue.")
+                        if not confirm_direct_batch:
+                            errors.append("Cochez la confirmation d'émission administrative en lot.")
+                        rows_to_process = []
+                        for _, row in edited_batch_table.iterrows():
+                            try:
+                                row_no = int(row["Ligne source"])
+                            except (TypeError, ValueError):
+                                continue
+                            dept_value = _source_value(row.get("Département à attribuer", ""))
+                            if dept_value not in DEPARTEMENTS:
+                                errors.append(f"{row.get('Enseignant (fichier source)', '')} : département non attribué, ligne {row_no}.")
+                                continue
+                            if allowed_dept is not None and dept_value != allowed_dept:
+                                errors.append(f"{row.get('Enseignant (fichier source)', '')} : votre compte ne peut traiter que {allowed_dept}.")
+                                continue
+                            if generation_scope != "Tous les départements" and dept_value != generation_scope:
+                                errors.append(f"{row.get('Enseignant (fichier source)', '')} : le département attribué ne correspond pas à la portée choisie.")
+                                continue
+                            detail = candidate_by_row.get(row_no)
+                            if not detail:
+                                continue
+                            person = detail["person"]
+                            dob = clean_date_input(person.get("date_naissance", "")) or clean_date_input(_normalize_source_date(person.get("date_naissance", "")))
+                            birthplace = _source_value(person.get("lieu_naissance", ""))
+                            if not (person.get("nom") and person.get("prenom") and dob and birthplace):
+                                errors.append(f"{person.get('full_name_fr','')} : nom, prénom, date ou lieu de naissance incomplet.")
+                                continue
+                            existing_records_for_person = detail["existing_records"]
+                            other_dept_record = next((r for r in existing_records_for_person if r.get("department") != dept_value), None)
+                            same_dept_generated = next((r for r in existing_records_for_person if r.get("department") == dept_value and r.get("status") == "Générée" and r.get("attestation_number") not in (None, "")), None)
+                            same_dept_pending = next((r for r in existing_records_for_person if r.get("department") == dept_value and r.get("status") != "Générée"), None)
+                            if other_dept_record and not same_dept_generated and not same_dept_pending:
+                                errors.append(f"{person.get('full_name_fr','')} : une demande/attestation existe déjà dans un autre département ; vérification nécessaire.")
+                                continue
+                            if same_dept_generated:
+                                rows_to_process.append((row_no, dept_value, detail, same_dept_generated, None))
+                            else:
+                                rows_to_process.append((row_no, dept_value, detail, same_dept_pending, None))
+
+                        departments_needing_signer = sorted({dept for _, dept, _, _, _ in rows_to_process}, key=lambda d: list(DEPARTEMENTS.keys()).index(d))
+                        for dept in departments_needing_signer:
+                            chef_fr_value, chef_ar_value = chef_fields.get(dept, ("", ""))
+                            if not (chef_fr_value or chef_ar_value):
+                                errors.append(f"Nom du chef de {dept} manquant en français et en arabe.")
+                        if errors:
+                            st.error("Certains éléments nécessitent une correction ou seront ignorés. " + " | ".join(errors[:12]) + (f" | … {len(errors)-12} autre(s) élément(s)." if len(errors) > 12 else ""))
+                        fatal_errors = [e for e in errors if e.startswith("Nom du chef de ")]
+                        blocked = (not bulk_languages) or (not confirm_direct_batch) or bool(fatal_errors)
+                        if rows_to_process and not blocked:
+                            newly_issued = 0
+                            reused_issued = 0
+                            failed = []
+                            records_for_zip: dict[str, dict] = {}
+                            progress = st.progress(0, text="Préparation des attestations…")
+                            for index, (row_no, dept_value, detail, prior_record, _) in enumerate(rows_to_process, start=1):
+                                person = detail["person"]
+                                sessions = detail["sessions"]
+                                matched_names = detail["matched_names"]
+                                match_mode = detail["match_mode"]
+                                snapshot = _build_source_snapshot(person, batch_source_name, sessions, matched_names, match_mode, batch_edt_name)
+                                dob = clean_date_input(person.get("date_naissance", "")) or clean_date_input(_normalize_source_date(person.get("date_naissance", "")))
+                                birthplace = _source_value(person.get("lieu_naissance", ""))
+                                chef_fr_value, chef_ar_value = chef_fields[dept_value]
+                                if prior_record and prior_record.get("status") == "Générée" and prior_record.get("attestation_number") not in (None, ""):
+                                    issued_record = prior_record
+                                    reused_issued += 1
+                                else:
+                                    try:
+                                        if prior_record:
+                                            request_record = prior_record
+                                            # Garder l'identité/source existante, compléter le snapshot pour les futurs exports.
+                                            if request_record.get("source_snapshot"):
+                                                snapshot = {**request_record["source_snapshot"], **snapshot}
+                                        else:
+                                            request_record = create_request({
+                                                "department": dept_value,
+                                                "nom": person["nom"],
+                                                "prenom": person["prenom"],
+                                                "date_naissance": dob,
+                                                "lieu_naissance": birthplace,
+                                                "email": person.get("email", ""),
+                                                "telephone": person.get("telephone", ""),
+                                                "purpose": "Émission administrative groupée par le chef de département, sans demande préalable de l'intéressé.",
+                                                "language_mode": bulk_languages[0],
+                                                "source_snapshot": snapshot,
+                                            })
+                                        final_data = {
+                                            "department": dept_value,
+                                            "nom": person["nom"], "prenom": person["prenom"],
+                                            "date_naissance": dob, "lieu_naissance": birthplace,
+                                            "nom_ar": person.get("nom_ar", ""), "prenom_ar": person.get("prenom_ar", ""),
+                                            "chef_fr": chef_fr_value, "chef_ar": chef_ar_value,
+                                            "reference": bulk_reference.strip() or REFERENCE_PAR_DEFAUT,
+                                            "matiere_s1": snapshot.get("edt_subjects_text") or person.get("matiere_s1", ""),
+                                            "debut_s1": batch_s1_start.strip(), "fin_s1": batch_s1_end.strip(),
+                                            "promotions_s1": snapshot.get("edt_promotions_text", ""),
+                                            "section_s1": snapshot.get("edt_promotions_text", ""),
+                                            "annee_s1": batch_s1_year.strip(),
+                                            "matiere_s2": batch_s2_subjects.strip(),
+                                            "debut_s2": batch_s2_start.strip(), "fin_s2": batch_s2_end.strip(),
+                                            "promotions_s2": batch_s2_promotions.strip(), "section_s2": batch_s2_promotions.strip(),
+                                            "annee_s2": batch_s2_year.strip(),
+                                            "language_mode": bulk_languages[0],
+                                            "emission_sans_demande": True,
+                                            "source_nom_complet_fr": person.get("full_name_fr", ""),
+                                            "source_nom_complet_ar": person.get("full_name_ar", ""),
+                                            "type_enseignement_source": person.get("type_enseignement", ""),
+                                            "dernier_diplome_source": person.get("dernier_diplome", ""),
+                                            "edt_subjects": snapshot.get("edt_subjects", []),
+                                            "edt_subjects_with_type": snapshot.get("edt_subjects_with_type", []),
+                                            "edt_subjects_text": snapshot.get("edt_subjects_text", ""),
+                                            "edt_promotions": snapshot.get("edt_promotions", []),
+                                            "edt_promotions_text": snapshot.get("edt_promotions_text", ""),
+                                            "edt_teacher_names": snapshot.get("edt_teacher_names", []),
+                                            "edt_match_mode": snapshot.get("edt_match_mode", "aucun"),
+                                            "edt_session_count": snapshot.get("edt_session_count", 0),
+                                            "edt_source_file": batch_edt_name,
+                                            "source_row": person.get("source_row"),
+                                        }
+                                        issued_record = issue_request(request_record["id"], final_data)
+                                        if not issued_record or issued_record.get("status") != "Générée":
+                                            raise RuntimeError("Le registre n'a pas confirmé l'émission officielle.")
+                                        newly_issued += 1
+                                    except Exception as exc:
+                                        failed.append(f"{person.get('full_name_fr','')}: {exc}")
+                                        continue
+                                records_for_zip[str(issued_record.get("id"))] = issued_record
+                                progress.progress(index / max(1, len(rows_to_process)), text=f"Traitement {index}/{len(rows_to_process)} : {person.get('full_name_fr','')}")
+                            progress.empty()
+                            if records_for_zip:
+                                zip_data, files_count = _attestations_zip(list(records_for_zip.values()), language_modes=bulk_languages)
+                                st.success(f"Lot terminé : {newly_issued} nouvelle(s) émission(s), {reused_issued} attestation(s) déjà émises réutilisée(s), {len(failed)} échec(s). {files_count} document(s) Word dans le ZIP.")
+                                if failed:
+                                    with st.expander("Détails des échecs", expanded=False):
+                                        st.write("\n".join(failed))
+                                stamp = datetime.now(TZ_ALGERIA).strftime("%Y%m%d_%H%M")
+                                dept_zip_name = "Tous_Departements" if generation_scope == "Tous les départements" else _safe_filename(generation_scope)
+                                language_zip_name = "_".join({LANGUES[0]: "Bilingue", LANGUES[1]: "Arabe", LANGUES[2]: "Francais"}[x] for x in bulk_languages)
+                                st.download_button(
+                                    f"📥 Télécharger le ZIP des attestations ({files_count} document(s))",
+                                    data=zip_data,
+                                    file_name=f"Attestations_Source_{dept_zip_name}_{language_zip_name}_{stamp}.zip",
+                                    mime="application/zip",
+                                    type="primary",
+                                    use_container_width=True,
+                                    key=f"direct_batch_download_{scope_key}_{stamp}",
+                                )
+                                st.caption("Un seul numéro officiel est attribué par enseignant ; les différentes versions linguistiques d'un même document conservent le même numéro, la même date et la même référence. Les dossiers déjà générés ne reçoivent pas un nouveau numéro.")
+                            else:
+                                st.error("Aucune attestation n'a pu être incluse dans l'archive.")
+                else:
+                    st.info("Aucun enseignant ne correspond à la portée sélectionnée, ou aucun fichier source disponible.")
 
         tab_pending, tab_issued = st.tabs(["📥 Demandes à traiter", "✅ Attestations générées"])
         with tab_pending:
@@ -868,25 +1484,29 @@ else:
                 zip_issued_records = []
                 st.error(f"Impossible de préparer l'archive des attestations : {exc}")
             if zip_issued_records:
-                bulk_language = st.selectbox(
-                    "Langue pour toutes les attestations de l'archive ZIP",
+                bulk_languages = st.multiselect(
+                    "Formats à inclure dans le ZIP (vous pouvez en choisir un, deux ou les trois)",
                     LANGUES,
-                    index=0,
-                    key=f"bulk_attestation_language_{allowed_dept or 'all'}",
-                    help="La langue choisie s'applique aux copies Word placées dans le ZIP. Les numéros, dates et références déjà attribués sont conservés.",
+                    default=list(LANGUES),
+                    key=f"bulk_attestation_languages_{allowed_dept or 'all'}",
+                    help="Chaque attestation sélectionnée sera générée dans chacun des formats choisis : arabe, français et/ou bilingue. Les numéros, dates et références existants restent identiques.",
                 )
-                zip_data, zip_count = _attestations_zip(zip_issued_records, language_mode=bulk_language)
-                zip_label = "tous les départements" if allowed_dept is None else f"département {allowed_dept}"
-                st.download_button(
-                    f"📦 Télécharger toutes les attestations Word en ZIP ({zip_count} document(s) — {zip_label})",
-                    data=zip_data,
-                    file_name=("Attestations_Tous_Departements.zip" if allowed_dept is None else f"Attestations_{_safe_filename(allowed_dept)}.zip"),
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                    key=f"zip_attestations_{allowed_dept or 'all'}",
-                )
-                st.caption("L'archive contient toutes les attestations déjà émises pour le périmètre autorisé, dans la langue sélectionnée. Chaque document conserve son numéro officiel, sa date de délivrance et sa référence ; le téléchargement groupé ne consomme pas de nouveaux numéros. Les demandes en attente doivent d'abord être complétées et émises.")
+                if not bulk_languages:
+                    st.info("Sélectionnez au moins un format de langue pour préparer l'archive.")
+                else:
+                    zip_data, zip_count = _attestations_zip(zip_issued_records, language_modes=bulk_languages)
+                    zip_label = "tous les départements" if allowed_dept is None else f"département {allowed_dept}"
+                    language_label = "_".join({LANGUES[0]: "Bilingue", LANGUES[1]: "Arabe", LANGUES[2]: "Francais"}[item] for item in bulk_languages)
+                    st.download_button(
+                        f"📦 Télécharger les attestations Word en ZIP ({zip_count} fichier(s) — {len(zip_issued_records)} attestation(s) — {zip_label})",
+                        data=zip_data,
+                        file_name=f"Attestations_{'Tous_Departements' if allowed_dept is None else _safe_filename(allowed_dept)}_{language_label}.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"zip_attestations_{allowed_dept or 'all'}",
+                    )
+                    st.caption("Pour chaque attestation déjà émise, l'archive contient une copie pour chaque langue choisie. Les numéros, dates et références ne sont pas réattribués. Les demandes encore en attente doivent d'abord être complétées et validées par le chef.")
             else:
                 st.info("Aucune attestation finalisée à inclure dans l'archive pour ce périmètre.")
             if not issued:

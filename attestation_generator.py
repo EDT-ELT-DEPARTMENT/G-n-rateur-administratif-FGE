@@ -387,7 +387,11 @@ def add_arabic_page(doc, values: dict[str, Any], page_label: str):
     add_para(doc, f"المولود(ة) بتاريخ: {birth_date} بـ {birth_place}", rtl=True, size=10.5, after=50)
     add_semester_ar(doc, 1, values)
     add_semester_ar(doc, 2, values)
-    add_para(doc, "سُلّمت هذه الشهادة بطلب من المعني(ة) بالأمر لاستعمالها في حدود ما يسمح به القانون.", rtl=True, size=10.5, bold=True, before=8, after=4)
+    if values.get("emission_sans_demande"):
+        cloture_ar = "سُلّمت هذه الشهادة لأغراض إدارية، لاستعمالها في حدود ما يسمح به القانون."
+    else:
+        cloture_ar = "سُلّمت هذه الشهادة بطلب من المعني(ة) بالأمر لاستعمالها في حدود ما يسمح به القانون."
+    add_para(doc, cloture_ar, rtl=True, size=10.5, bold=True, before=8, after=4)
     add_footer(section, values.get("reference", "UDL-GEL-ER-120-2026"), page_label)
 
 
@@ -423,7 +427,11 @@ def add_french_page(doc, values: dict[str, Any], page_label: str):
     add_para(doc, f"Né(e) le : {format_value(values.get('date_naissance'), '……/……/………')} à : {format_value(values.get('lieu_naissance'), '........................')}", align=WD_ALIGN_PARAGRAPH.LEFT, size=11, after=6)
     add_semester_fr(doc, 1, values)
     add_semester_fr(doc, 2, values)
-    add_para(doc, "La présente attestation est délivrée à l'intéressé(e) à sa demande, pour servir et valoir ce que de droit.", align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, bold=True, before=5, after=6)
+    if values.get("emission_sans_demande"):
+        cloture_fr = "La présente attestation est délivrée à des fins administratives, pour servir et valoir ce que de droit."
+    else:
+        cloture_fr = "La présente attestation est délivrée à l'intéressé(e) à sa demande, pour servir et valoir ce que de droit."
+    add_para(doc, cloture_fr, align=WD_ALIGN_PARAGRAPH.LEFT, size=10.5, bold=True, before=5, after=6)
     add_footer(section, values.get("reference", "UDL-GEL-ER-120-2026"), page_label)
 
 
