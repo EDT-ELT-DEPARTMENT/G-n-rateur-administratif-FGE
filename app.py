@@ -1648,9 +1648,7 @@ else:
             except Exception as exc:
                 saved_files = []
                 st.error(
-                    "Impossible de lire les archives persistantes. Si l'application est sur Streamlit Cloud, "
-                    "exécutez le script supabase_schema.sql mis à jour dans Supabase > SQL Editor. "
-                    f"Détail technique : {exc}"
+                    ""
                 )
             if saved_files:
                 archive_rows = [{
