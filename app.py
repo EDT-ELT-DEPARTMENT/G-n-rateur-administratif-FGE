@@ -629,62 +629,10 @@ if st.session_state.get("chief_authenticated", False):
                 "chief_authenticated", "chief_department", "chief_is_master",
                 "last_issued_request_id", "last_issued_document",
                 "generation_archive_download", "bulk_source_request_result",
-                "confirm_clear_all_attestation_history", "confirm_clear_all_attestation_history_text",
             ):
                 st.session_state.pop(session_key, None)
+            st.session_state["history_clear_form_version"] = int(st.session_state.get("history_clear_form_version", 0)) + 1
             st.rerun()
-
-# Zone d'historique placée en haut de page pour être facile à trouver.
-# Elle reste visible pour toute session authentifiée, mais l'action globale
-# est disponible uniquement avec le mot de passe ADMIN_PASSWORD.
-if st.session_state.get("chief_authenticated", False):
-    st.divider()
-    with st.expander("⚠️ Effacer l’historique des demandes", expanded=True):
-        if st.session_state.get("chief_is_master", False):
-            st.error(
-                "Cette action supprime définitivement toutes les demandes en attente et générées "
-                "dans les quatre départements. Elle ne supprime PAS les fichiers du dossier "
-                "des générations sauvegardées et ne remet PAS les numéros officiels à zéro. "
-                "Téléchargez une sauvegarde des archives avant de continuer."
-            )
-            confirm_history_clear = st.checkbox(
-                "Je confirme vouloir supprimer toutes les demandes du registre.",
-                key="confirm_clear_all_attestation_history",
-            )
-            confirm_history_text = st.text_input(
-                "Saisissez exactement : EFFACER TOUT L'HISTORIQUE",
-                key="confirm_clear_all_attestation_history_text",
-            )
-            if st.button(
-                "🗑️ Effacer tout l’historique des demandes",
-                type="primary",
-                disabled=not (confirm_history_clear and confirm_history_text.strip() == "EFFACER TOUT L'HISTORIQUE"),
-                key="clear_all_attestation_history_button_top",
-                use_container_width=True,
-            ):
-                try:
-                    deleted_count = delete_all_request_history()
-                    for session_key in (
-                        "last_issued_document", "last_issued_request_id", "generation_archive_download",
-                        "bulk_source_request_result", "pending_request_all", "pending_request_Electrotechnique",
-                        "pending_request_Automatique", "pending_request_Electronique", "pending_request_Télécommunications",
-                    ):
-                        st.session_state.pop(session_key, None)
-                    st.session_state["history_cleared_count_notice"] = deleted_count
-                    st.session_state["confirm_clear_all_attestation_history"] = False
-                    st.session_state["confirm_clear_all_attestation_history_text"] = ""
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"L'historique n'a pas pu être effacé : {exc}")
-        else:
-            st.warning(
-                "Vous êtes connecté avec un compte chef de département. L'effacement global est réservé "
-                "à l'administrateur général. Déconnectez-vous, puis reconnectez-vous avec le secret "
-                "ADMIN_PASSWORD pour afficher les commandes de suppression."
-            )
-
-if st.session_state.pop("history_cleared_count_notice", None) is not None:
-    st.success("Historique des demandes effacé. Les archives générées et les compteurs officiels sont conservés.")
 
 mode = backend_mode()
 if mode == "sqlite":
@@ -1081,7 +1029,7 @@ else:
                 st.rerun()
             else:
                 st.error("Mot de passe incorrect ou non configuré pour ce département.")
-        st.caption("Chaque chef peut disposer d'un mot de passe propre à son département. Pour effacer l'historique global, connectez-vous avec le mot de passe ADMIN_PASSWORD (administrateur général), et non le mot de passe départemental.")
+        st.caption("Chaque chef peut disposer d'un mot de passe propre à son département. L'administrateur global peut traiter les quatre départements.")
         if not get_setting("ADMIN_PASSWORD") and not any(configured_for_department(d) for d in DEPARTEMENTS):
             st.warning("Aucun mot de passe chef n'est configuré. Ajoutez ADMIN_PASSWORD ou les mots de passe CHEF_PASSWORD_* dans les Secrets.")
     else:
@@ -1802,6 +1750,45 @@ else:
             archive_dir_path = APP_DIR / "archives_generations"
             st.caption(f"Dossier local de sauvegarde : `{archive_dir_path}`. Sur Streamlit Cloud, les fichiers sont également conservés dans la base Supabase après l'installation du schéma SQL mis à jour.")
 
+        # Suppression des demandes : réservée à l'administrateur global, séparée du dossier d'archives.
+        if st.session_state.get("chief_is_master"):
+            with st.expander("⚠️ Zone sensible — Effacer tout l'historique des demandes", expanded=False):
+                st.error(
+                    "Cette action supprime définitivement toutes les demandes (en attente et générées) du registre. "
+                    "Elle NE supprime PAS le dossier des générations sauvegardées et NE remet PAS les numéros officiels à zéro."
+                )
+                # Utiliser une génération de clés permet de réinitialiser le formulaire après
+                # effacement sans modifier une clé de widget déjà créée dans ce même rendu.
+                history_clear_form_version = int(st.session_state.get("history_clear_form_version", 0))
+                confirm_checkbox_key = f"confirm_clear_all_attestation_history_{history_clear_form_version}"
+                confirm_text_key = f"confirm_clear_all_attestation_history_text_{history_clear_form_version}"
+                confirm_history_clear = st.checkbox(
+                    "J'ai compris que toutes les demandes du registre, dans les quatre départements, seront supprimées.",
+                    key=confirm_checkbox_key,
+                )
+                confirm_history_text = st.text_input(
+                    "Pour confirmer, saisissez exactement : EFFACER TOUT L'HISTORIQUE",
+                    key=confirm_text_key,
+                )
+                if st.button(
+                    "🗑️ Effacer tout l'historique des demandes",
+                    type="primary",
+                    disabled=not (confirm_history_clear and confirm_history_text.strip() == "EFFACER TOUT L'HISTORIQUE"),
+                    key="clear_all_attestation_history_button",
+                ):
+                    try:
+                        deleted_count = delete_all_request_history()
+                        for session_key in ("last_issued_document", "last_issued_request_id", "generation_archive_download"):
+                            st.session_state.pop(session_key, None)
+                        st.session_state["history_cleared_count_notice"] = deleted_count
+                        # Change uniquement une clé non liée à un widget. Au rerun, les champs
+                        # utilisent de nouvelles clés et reviennent donc décochés / vides.
+                        st.session_state["history_clear_form_version"] = history_clear_form_version + 1
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"L'historique n'a pas pu être effacé : {exc}")
+        if st.session_state.pop("history_cleared_count_notice", None) is not None:
+            st.success("Historique des demandes effacé. Les archives générées et les compteurs officiels sont conservés.")
         archive_notice = st.session_state.pop("archive_save_notice", None)
         if archive_notice:
             st.warning(archive_notice)
