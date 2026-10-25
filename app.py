@@ -1786,19 +1786,3 @@ else:
             )
 
 st.divider()
-with st.expander("ℹ️ Configuration, stockage durable et déploiement"):
-    st.markdown("""
-### Déploiement
-- Téléversez `app.py`, `attestation_generator.py`, `edt_individuel.py`, `storage.py`, `requirements.txt`, `assets/logo_udl.png`, `EDT_Edition.xlsx`, `Vos coordonnées (réponses).xlsx` (dépôt privé uniquement), `Modele_Source_Donnees_Attestations.xlsx`, `.streamlit/config.toml`, `.streamlit/secrets.toml.example` et `supabase_schema.sql` dans votre dépôt GitHub.
-- Dans Streamlit Community Cloud, sélectionnez ce dépôt, la branche `main` et `app.py` comme fichier principal.
-- Dans **Settings → Secrets**, configurez les mots de passe des chefs. Pour le stockage permanent Cloud, ajoutez `SUPABASE_URL` et `SUPABASE_SERVICE_ROLE_KEY`, puis exécutez `supabase_schema.sql` dans le SQL Editor de Supabase.
-- Pour les notifications par e-mail, renseignez `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` et `CHEF_EMAIL_*`. Sans SMTP, la demande reste enregistrée et visible dans l'espace du chef, mais aucun e-mail automatique ne sera envoyé.
-
-### Numérotation
-Le numéro est attribué au moment de la génération officielle et suit un compteur annuel partagé entre les quatre départements. Le numéro/date sont conservés quand on retélécharge un document déjà émis; un simple téléchargement ne consomme pas un nouveau numéro.
-
-### Données personnelles
-N'ajoutez aucun fichier de personnel confidentiel au dépôt GitHub. La clé Supabase service-role doit rester dans les Secrets et ne jamais être intégrée au code ou au dépôt. Utilisez un dépôt privé et donnez l'accès seulement aux personnes autorisées.
-""")
-
-st.caption("Le document Word reprend les matières identifiées dans EDT_Edition.xlsx lorsqu'une correspondance enseignant est trouvée. Les autres informations pédagogiques et la date/numérotation officielles sont vérifiées ou attribuées par le chef lors de l'émission.")
