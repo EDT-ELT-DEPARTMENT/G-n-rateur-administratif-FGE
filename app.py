@@ -610,6 +610,82 @@ def render_download(record: dict, button_key: str) -> None:
 role_options = ["Déposer une demande", "Espace chef de département"]
 role = st.radio("Accès à l'application", role_options, horizontal=True, key="workflow_role")
 
+# Bouton de déconnexion rendu visible dans toutes les rubriques dès qu'une
+# session chef/admin est ouverte, au lieu de le cacher dans le seul espace chef.
+if st.session_state.get("chief_authenticated", False):
+    is_master_session = bool(st.session_state.get("chief_is_master", False))
+    session_label = (
+        "Administrateur global connecté — accès aux quatre départements."
+        if is_master_session
+        else f"Chef de département connecté : {st.session_state.get('chief_department', 'Département non renseigné')}."
+    )
+    status_col, logout_col = st.columns([5, 1.6])
+    with status_col:
+        st.info("🔐 " + session_label)
+    with logout_col:
+        logout_label = "🚪 Déconnexion administrateur" if is_master_session else "🚪 Déconnexion chef"
+        if st.button(logout_label, key="chief_logout_global_top", type="primary", use_container_width=True):
+            for session_key in (
+                "chief_authenticated", "chief_department", "chief_is_master",
+                "last_issued_request_id", "last_issued_document",
+                "generation_archive_download", "bulk_source_request_result",
+                "confirm_clear_all_attestation_history", "confirm_clear_all_attestation_history_text",
+            ):
+                st.session_state.pop(session_key, None)
+            st.rerun()
+
+# Zone d'historique placée en haut de page pour être facile à trouver.
+# Elle reste visible pour toute session authentifiée, mais l'action globale
+# est disponible uniquement avec le mot de passe ADMIN_PASSWORD.
+if st.session_state.get("chief_authenticated", False):
+    st.divider()
+    with st.expander("⚠️ Effacer l’historique des demandes", expanded=True):
+        if st.session_state.get("chief_is_master", False):
+            st.error(
+                "Cette action supprime définitivement toutes les demandes en attente et générées "
+                "dans les quatre départements. Elle ne supprime PAS les fichiers du dossier "
+                "des générations sauvegardées et ne remet PAS les numéros officiels à zéro. "
+                "Téléchargez une sauvegarde des archives avant de continuer."
+            )
+            confirm_history_clear = st.checkbox(
+                "Je confirme vouloir supprimer toutes les demandes du registre.",
+                key="confirm_clear_all_attestation_history",
+            )
+            confirm_history_text = st.text_input(
+                "Saisissez exactement : EFFACER TOUT L'HISTORIQUE",
+                key="confirm_clear_all_attestation_history_text",
+            )
+            if st.button(
+                "🗑️ Effacer tout l’historique des demandes",
+                type="primary",
+                disabled=not (confirm_history_clear and confirm_history_text.strip() == "EFFACER TOUT L'HISTORIQUE"),
+                key="clear_all_attestation_history_button_top",
+                use_container_width=True,
+            ):
+                try:
+                    deleted_count = delete_all_request_history()
+                    for session_key in (
+                        "last_issued_document", "last_issued_request_id", "generation_archive_download",
+                        "bulk_source_request_result", "pending_request_all", "pending_request_Electrotechnique",
+                        "pending_request_Automatique", "pending_request_Electronique", "pending_request_Télécommunications",
+                    ):
+                        st.session_state.pop(session_key, None)
+                    st.session_state["history_cleared_count_notice"] = deleted_count
+                    st.session_state["confirm_clear_all_attestation_history"] = False
+                    st.session_state["confirm_clear_all_attestation_history_text"] = ""
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"L'historique n'a pas pu être effacé : {exc}")
+        else:
+            st.warning(
+                "Vous êtes connecté avec un compte chef de département. L'effacement global est réservé "
+                "à l'administrateur général. Déconnectez-vous, puis reconnectez-vous avec le secret "
+                "ADMIN_PASSWORD pour afficher les commandes de suppression."
+            )
+
+if st.session_state.pop("history_cleared_count_notice", None) is not None:
+    st.success("Historique des demandes effacé. Les archives générées et les compteurs officiels sont conservés.")
+
 mode = backend_mode()
 if mode == "sqlite":
     st.warning(
@@ -1005,20 +1081,16 @@ else:
                 st.rerun()
             else:
                 st.error("Mot de passe incorrect ou non configuré pour ce département.")
-        st.caption("Chaque chef peut disposer d'un mot de passe propre à son département. L'administrateur global peut traiter les quatre départements.")
+        st.caption("Chaque chef peut disposer d'un mot de passe propre à son département. Pour effacer l'historique global, connectez-vous avec le mot de passe ADMIN_PASSWORD (administrateur général), et non le mot de passe départemental.")
         if not get_setting("ADMIN_PASSWORD") and not any(configured_for_department(d) for d in DEPARTEMENTS):
             st.warning("Aucun mot de passe chef n'est configuré. Ajoutez ADMIN_PASSWORD ou les mots de passe CHEF_PASSWORD_* dans les Secrets.")
     else:
         if st.session_state.get("chief_is_master"):
             allowed_dept = None
-            st.success("Session administrateur global : accès aux quatre départements.")
+            st.caption("Espace administrateur global : accès aux quatre départements.")
         else:
             allowed_dept = st.session_state.get("chief_department")
-            st.success(f"Session chef de département : {allowed_dept}.")
-        if st.button("Déconnexion de l'espace chef", key="chief_logout"):
-            for key in ("chief_authenticated", "chief_department", "chief_is_master", "last_issued_request_id"):
-                st.session_state.pop(key, None)
-            st.rerun()
+            st.caption(f"Espace chef de département : {allowed_dept}.")
 
         dept_filter = allowed_dept
         if allowed_dept is None:
@@ -1648,7 +1720,9 @@ else:
             except Exception as exc:
                 saved_files = []
                 st.error(
-                    ""
+                    "Impossible de lire les archives persistantes. Si l'application est sur Streamlit Cloud, "
+                    "exécutez le script supabase_schema.sql mis à jour dans Supabase > SQL Editor. "
+                    f"Détail technique : {exc}"
                 )
             if saved_files:
                 archive_rows = [{
@@ -1728,39 +1802,6 @@ else:
             archive_dir_path = APP_DIR / "archives_generations"
             st.caption(f"Dossier local de sauvegarde : `{archive_dir_path}`. Sur Streamlit Cloud, les fichiers sont également conservés dans la base Supabase après l'installation du schéma SQL mis à jour.")
 
-        # Suppression des demandes : réservée à l'administrateur global, séparée du dossier d'archives.
-        if st.session_state.get("chief_is_master"):
-            with st.expander("⚠️ Zone sensible — Effacer tout l'historique des demandes", expanded=False):
-                st.error(
-                    "Cette action supprime définitivement toutes les demandes (en attente et générées) du registre. "
-                    "Elle NE supprime PAS le dossier des générations sauvegardées et NE remet PAS les numéros officiels à zéro."
-                )
-                confirm_history_clear = st.checkbox(
-                    "J'ai compris que toutes les demandes du registre, dans les quatre départements, seront supprimées.",
-                    key="confirm_clear_all_attestation_history",
-                )
-                confirm_history_text = st.text_input(
-                    "Pour confirmer, saisissez exactement : EFFACER TOUT L'HISTORIQUE",
-                    key="confirm_clear_all_attestation_history_text",
-                )
-                if st.button(
-                    "🗑️ Effacer tout l'historique des demandes",
-                    type="primary",
-                    disabled=not (confirm_history_clear and confirm_history_text.strip() == "EFFACER TOUT L'HISTORIQUE"),
-                    key="clear_all_attestation_history_button",
-                ):
-                    try:
-                        deleted_count = delete_all_request_history()
-                        for session_key in ("last_issued_document", "last_issued_request_id", "generation_archive_download"):
-                            st.session_state.pop(session_key, None)
-                        st.session_state["history_cleared_count_notice"] = deleted_count
-                        st.session_state["confirm_clear_all_attestation_history"] = False
-                        st.session_state["confirm_clear_all_attestation_history_text"] = ""
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"L'historique n'a pas pu être effacé : {exc}")
-        if st.session_state.pop("history_cleared_count_notice", None) is not None:
-            st.success("Historique des demandes effacé. Les archives générées et les compteurs officiels sont conservés.")
         archive_notice = st.session_state.pop("archive_save_notice", None)
         if archive_notice:
             st.warning(archive_notice)
@@ -1784,3 +1825,19 @@ else:
             )
 
 st.divider()
+with st.expander("ℹ️ Configuration, stockage durable et déploiement"):
+    st.markdown("""
+### Déploiement
+- Téléversez `app.py`, `attestation_generator.py`, `edt_individuel.py`, `storage.py`, `requirements.txt`, `assets/logo_udl.png`, `EDT_Edition.xlsx`, `Vos coordonnées (réponses).xlsx` (dépôt privé uniquement), `Modele_Source_Donnees_Attestations.xlsx`, `.streamlit/config.toml`, `.streamlit/secrets.toml.example` et `supabase_schema.sql` dans votre dépôt GitHub.
+- Dans Streamlit Community Cloud, sélectionnez ce dépôt, la branche `main` et `app.py` comme fichier principal.
+- Dans **Settings → Secrets**, configurez les mots de passe des chefs. Pour le stockage permanent Cloud, ajoutez `SUPABASE_URL` et `SUPABASE_SERVICE_ROLE_KEY`, puis exécutez `supabase_schema.sql` dans le SQL Editor de Supabase.
+- Pour les notifications par e-mail, renseignez `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` et `CHEF_EMAIL_*`. Sans SMTP, la demande reste enregistrée et visible dans l'espace du chef, mais aucun e-mail automatique ne sera envoyé.
+
+### Numérotation
+Le numéro est attribué au moment de la génération officielle et suit un compteur annuel partagé entre les quatre départements. Le numéro/date sont conservés quand on retélécharge un document déjà émis; un simple téléchargement ne consomme pas un nouveau numéro.
+
+### Données personnelles
+N'ajoutez aucun fichier de personnel confidentiel au dépôt GitHub. La clé Supabase service-role doit rester dans les Secrets et ne jamais être intégrée au code ou au dépôt. Utilisez un dépôt privé et donnez l'accès seulement aux personnes autorisées.
+""")
+
+st.caption("Le document Word reprend les matières identifiées dans EDT_Edition.xlsx lorsqu'une correspondance enseignant est trouvée. Les autres informations pédagogiques et la date/numérotation officielles sont vérifiées ou attribuées par le chef lors de l'émission.")
